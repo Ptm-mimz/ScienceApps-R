@@ -1,0 +1,46 @@
+```{r}
+library(cellpaintr)
+library(ggplot2)
+library(scater)
+library(scran)
+library(bluster)
+library(tidyr)
+library(dplyr)
+```
+
+# path to files
+
+```{r}
+
+file_plate1 <- paste0(
+  "/scratch/plapha/250311 hottip reimage + pp38/output/",
+  "MyExpt_Cells.csv"
+)
+
+file_plate2 <- paste0(
+  "/scratch/plapha/250311 hottip reimage + pp38/output/",
+  "MyExpt_Nuclei.csv"
+)
+
+sce_cell <- loadData(file_plate1)
+sce_nucleus <- loadData(file_plate2)
+
+# Rename columns in sce_cell to ensure column name (cell data)are unique
+colnames(colData(sce_cell)) <- paste0("cell_", colnames(colData(sce_cell)))
+
+# Rename columns in sce_nucleus to ensure column name (cell data)are unique
+colnames(colData(sce_nucleus)) <- paste0("nucleus_", colnames(colData(sce_nucleus)))
+
+#must use rbind because number of features between 2 data set ate different
+sce <- rbind(sce_cell, sce_nucleus)
+
+```
+
+## Data Transformation
+```{r}
+plotCellsPerImage(sce)
+sce <- removeOutliers(sce, min = 10, max = 100)
+
+sce <- removeMissingValues(sce)
+sce <- removeLowVariance(sce)
+sce <- transformLogScale(sce)
