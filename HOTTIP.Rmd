@@ -6,6 +6,9 @@ library(scran)
 library(bluster)
 library(tidyr)
 library(dplyr)
+library(stringr)
+library(ggpubr)
+
 ```
 
 # path to files
@@ -13,34 +16,268 @@ library(dplyr)
 ```{r}
 
 file_plate1 <- paste0(
-  "/scratch/plapha/250311 hottip reimage + pp38/output/",
+  "/scratch/plapha/250326 hottip reimage/output/",
   "MyExpt_Cells.csv"
 )
 
 file_plate2 <- paste0(
-  "/scratch/plapha/250311 hottip reimage + pp38/output/",
+  "/scratch/plapha/250326 hottip reimage/output/",
   "MyExpt_Nuclei.csv"
 )
 
-sce_cell <- loadData(file_plate1)
+file_plate3 <- paste0(
+  "/scratch/plapha/250326 hottip reimage/output/",
+  "MyExpt_Cytoplasm.csv"
+)
+
+
+sce_cells <- loadData(file_plate1)
 sce_nucleus <- loadData(file_plate2)
+sce_cyto <- loadData(file_plate3)
 
 # Rename columns in sce_cell to ensure column name (cell data)are unique
-colnames(colData(sce_cell)) <- paste0("cell_", colnames(colData(sce_cell)))
+rownames(sce_cells) <- paste0("cell_", rownames(sce_cells))
 
 # Rename columns in sce_nucleus to ensure column name (cell data)are unique
-colnames(colData(sce_nucleus)) <- paste0("nucleus_", colnames(colData(sce_nucleus)))
+rownames(sce_nucleus) <- paste0("nucleus_", rownames(sce_nucleus))
 
-#must use rbind because number of features between 2 data set ate different
-sce <- rbind(sce_cell, sce_nucleus)
+# Rename columns in sce_nucleus to ensure column name (cell data)are unique
+rownames(sce_cyto) <- paste0("cyto_", rownames(sce_cyto))
+
+colData(sce_nucleus) <- colData(sce_nucleus)[,!str_detect(colnames(colData(sce_nucleus)), "Location")]
+colData(sce_cells) <- colData(sce_cells)[,!str_detect(colnames(colData(sce_cells)), "Location")]
+colData(sce_cyto) <- colData(sce_cyto)[,!str_detect(colnames(colData(sce_cyto)), "Location")]
+
+
+#must use rbind because number of features between 2 data set are different
+sce <- rbind(sce_cells, sce_nucleus, sce_cyto)
+
 
 ```
 
 ## Data Transformation
 ```{r}
 plotCellsPerImage(sce)
-sce <- removeOutliers(sce, min = 10, max = 100)
+sce <- removeOutliers(sce, min = 5, max = 100)
 
 sce <- removeMissingValues(sce)
 sce <- removeLowVariance(sce)
-sce <- transformLogScale(sce)
+# sce <- transformLogScale(sce)
+
+```
+
+filter only Intensity data
+
+````{r}
+feature_names <- rownames(sce)
+
+#see all intensity feature name
+intensity_features <- grep("Intensity", feature_names, value = TRUE)
+print(intensity_features)
+
+# Extract intensity-related feature names
+intensity_features <- grep("Intensity", feature_names, value = TRUE)
+
+# Transpose the assay data and convert to a data frame
+intensity_data <- as.data.frame(t(assay(sce, "features"))) # change back to "tfmfeatures" if work with logtransform in above step
+
+# Subset intensity_data to keep only intensity-related columns
+intensity_data <- intensity_data[, intensity_features, drop = FALSE]
+
+
+# Extract metadata from colData
+metadata <- as.data.frame(colData(sce)[, c("Patient", "Treatment", "Disease")])  # Replace with correct column names
+
+# Combine metadata with intensity data
+df <- cbind(metadata, intensity_data)
+
+df_mean <- df %>%
+  group_by(Patient, Disease, Treatment) %>%
+  summarize(Mean_Intensity = mean(nucleus_Intensity_MeanIntensity_CorrEdU, na.rm = TRUE)) %>%
+  ungroup()
+
+```
+
+Plot for specific feature
+
+````{r}
+# Create the plot
+ggplot(df_mean, aes(x = Disease, y = Mean_Intensity)) +
+  geom_boxplot(aes(fill = Disease), alpha = 0.7, outlier.shape = NA) +  # Box plot
+  geom_jitter(width = 0.2, size = 3, alpha = 0.7) +  # Dots for each patient's mean intensity
+  facet_wrap(~ Treatment) +  # Facet by Treatment
+  labs(
+    title = "nucleus_Intensity_MeanIntensity_CorrEdU by Disease and Treatment",
+    x = "Disease",
+    y = "Mean nucleus_MeanIntensity_CorrEdU",
+    fill = "Disease"  # Legend for box plot fill
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 14),  # Increase general text size
+    axis.text.x = element_text(size = 12, angle = 45, hjust = 1),  # Increase x-axis label size and rotate
+    axis.text.y = element_text(size = 12),  # Increase y-axis label size
+    axis.title.x = element_text(size = 14),  # Increase x-axis title size
+    axis.title.y = element_text(size = 14),  # Increase y-axis title size
+    plot.title = element_text(size = 16, face = "bold"),  # Increase plot title size and make it bold
+    strip.text = element_text(size = 14)  # Increase facet label size
+  )
+
+
+```
+N to C ratio
+
+````{r}
+# Calculate the ratio
+df <- df %>%
+  mutate(Ratio = nucleus_Intensity_MeanIntensity_Corrpp38 / cyto_Intensity_MeanIntensity_Corrpp38)
+
+# Create the plot
+ggplot(df, aes(x = Ratio, fill = Treatment)) +
+  geom_histogram(aes(y = after_stat(density)), alpha = 0.5, position = "identity", bins = 30) +  # Overlay histograms
+  facet_wrap(~ Disease) +  # Facet by Disease
+  labs(
+    title = "Ratio of nucleus_Intensity_MeanIntensity_Corrpp38 to cyto_Intensity_MeanIntensity_Corrpp38",
+    x = "Ratio (Nucleus/Cyto)",
+    y = "Density",
+    fill = "Treatment"  # Legend for Treatment
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 14),  # Increase general text size
+    axis.text.x = element_text(size = 12, angle = 45, hjust = 1),  # Increase x-axis label size and rotate
+    axis.text.y = element_text(size = 12),  # Increase y-axis label size
+    axis.title.x = element_text(size = 14),  # Increase x-axis title size
+    axis.title.y = element_text(size = 14),  # Increase y-axis title size
+    plot.title = element_text(size = 16, face = "bold"),  # Increase plot title size and make it bold
+    strip.text = element_text(size = 14)  # Increase facet label size
+  )
+
+```
+plot to see cut-off for EdU
+
+````{r}
+
+ggplot(df, aes(x = nucleus_Intensity_IntegratedIntensity_CorrEdU)) +
+    # Histogram
+    geom_histogram(bins = 100, fill = "skyblue", color = "black", boundary = 0) +
+    # Vertical line at x=0.1 (red dashed line for visibility)
+    geom_vline(xintercept = 0.15, color = "red", linetype = "dashed", linewidth = 0.8) +
+    # Axis limits (0-3)
+    coord_cartesian(xlim = c(0, 3)) +  # Use instead of scale_x_continuous to keep out-of-bounds data
+    labs(
+        title = "Nucleus Integrated Intensity of EdU by Treatment",
+        x = "Integrated Intensity (0-3)",
+        y = "Frequency"
+    ) +
+    # Facet by treatment
+    
+    theme_minimal() +
+    theme(
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text = element_text(face = "bold")
+    )
+
+```
+plot % positive EdU
+
+````{r}
+percent_data <- df %>%
+    group_by(Treatment, Patient, Disease) %>%  # Group by treatment and sample (adjust if needed)
+    summarise(
+        percent_above = 100 * mean(nucleus_Intensity_IntegratedIntensity_CorrEdU > 0.15, na.rm = TRUE),
+        .groups = "drop"
+    )
+
+ggplot(percent_data, aes(x = Treatment, y = percent_above, fill = Treatment)) +
+    geom_boxplot() +  # Boxplot of percentages
+    geom_jitter(width = 0.2, alpha = 0.5) +  # Overlay individual sample points
+    labs(
+        title = "Percentage of Cells with Nucleus Intensity > 0.15 by Treatment",
+        x = "Treatment",
+        y = "% of Cells",
+        fill = "Treatment"
+    ) +
+    facet_wrap(~ Disease)+
+   
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  theme(
+    text = element_text(size = 14),  # Increase general text size
+    axis.text.x = element_text(size = 12, angle = 45, hjust = 1),  # Increase x-axis label size and rotate
+    axis.text.y = element_text(size = 12),  # Increase y-axis label size
+    axis.title.x = element_text(size = 14),  # Increase x-axis title size
+    axis.title.y = element_text(size = 14),  # Increase y-axis title size
+    plot.title = element_text(size = 16, face = "bold"),  # Increase plot title size and make it bold
+    strip.text = element_text(size = 14)  # Increase facet label size
+  )
+
+
+```
+EdU with p21 (check bleed through)
+
+````{r}
+# Create a new column to define the two groups
+df$EdU_Group <- ifelse(
+  df$nucleus_Intensity_IntegratedIntensity_CorrEdU > 0.15,
+  "EdU > 0.15", 
+  "EdU ≤ 0.15"
+)
+
+# Convert to factor for proper ordering
+# 1. Create EdU groups
+df <- df %>%
+  mutate(EdU_Status = ifelse(
+    nucleus_Intensity_IntegratedIntensity_CorrEdU > 0.15,
+    "EdU > 0.15", 
+    "EdU ≤ 0.15"
+  ) %>% factor(levels = c("EdU ≤ 0.15", "EdU > 15")))
+
+
+#Plot Split Violin/Boxplot (Faceted by Treatment)
+
+ggplot(df, aes(x = Treatment, y = nucleus_Intensity_MeanIntensity_CorrP21)) +
+  geom_violin(aes(fill = Treatment), trim = FALSE, alpha = 0.7) +
+  geom_boxplot(width = 0.2, fill = "white", outlier.shape = NA) +
+  facet_wrap(~ EdU_Status, ncol = 2) + # Two panels side-by-side
+   facet_grid(Disease ~ EdU_Status) + 
+  labs(
+    title = "P21 Intensity Distribution by Treatment",
+    subtitle = "Stratified by EdU Status",
+    y = "Mean P21 Intensity (Corrected)",
+    x = ""
+  ) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(face = "bold", size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+#plot only EdU < 0.15 to avoid bleed through
+
+ggplot(subset(df, EdU_Status == "EdU ≤ 0.15"), 
+       aes(x = Treatment, 
+           y = nucleus_Intensity_MeanIntensity_CorrP21)) +
+  
+  # Violin plot only (no dots/points)
+  geom_violin(aes(fill = Treatment), 
+              trim = TRUE,          # Don't trim tails
+              alpha = 0.7,          # Transparency
+              width = 0.8) +        # Adjust width
+  
+  # Facet by disease
+  facet_wrap(~ Disease, nrow = 1) + # Horizontal arrangement
+  
+  # Labels and theme
+  labs(title = "P21 Intensity Distribution in Low EdU Cells (≤ 0.15)",
+       y = "Mean P21 Intensity (Corrected)",
+       x = NULL) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),  # Rotated x-labels
+    strip.text = element_text(face = "bold", size = 12)  # Bold facet titles
+  ) +
+  scale_fill_brewer(palette = "Set2")  # Colorblind-friendly palette
+
+```
+prepare data for H2AX and pp38
+
+````{r}
