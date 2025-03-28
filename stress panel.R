@@ -13,7 +13,7 @@ library(dplyr)
 ```{r}
 
 file_plate <- paste0(
-  "/scratch/plapha/250226 stress panel_TMRM/output/",
+  "/scratch/plapha/250320 stress panel_cytokine/output/",
   "MyExpt_Cells.csv"
 )
 
@@ -24,11 +24,52 @@ sce <- loadData(file_plate)
 ## Data Transformation
 ```{r}
 plotCellsPerImage(sce)
-sce <- removeOutliers(sce, min = 30, max = 200)
-sce <- removeMissingValues(sce)
+sce <- removeOutliers(sce, min = 10, max = 300)
+
+#sce <- removeMissingValues(sce)
+# remove missing values in cells
+mat <- assay(sce, name = "features")
+miss_perc_cells <- apply(mat, 2, function(x) mean(is.na(x)))
+cell_ids <- which(miss_perc_cells > 0)
+sce <- sce[, -cell_ids]
+
+sce <- removeLowVariance(sce)
+sce <- transformLogScale(sce)
+
+plotCellsPerImage(sce)
+sce <- removeOutliers(sce, min = 10, max = 300)
+ 
+ 
 sce <- removeLowVariance(sce)
 sce <- transformLogScale(sce)
 ```
+
+```{r}
+# sce1 <- sce
+sce <- sce1
+
+#if I want to delete feature that has 0 value
+mat <- assay(sce, name = "features")
+miss_perc_features <- apply(mat, 1, function(x) mean(is.na(x)))
+feature_ids <- which(miss_perc_features > 0)
+sce <- sce[-feature_ids,]
+
+###############################################################################
+
+
+#if I want to delete cell that has 0 value, but keep feature data
+mat <- assay(sce, name = "features")
+miss_perc_cells <- apply(mat, 2, function(x) mean(is.na(x)))
+cell_ids <- which(miss_perc_cells > 0)
+sce <- sce[, -cell_ids]
+
+###############################################################################
+
+sce <- removeLowVariance(sce)
+sce <- transformLogScale(sce)
+
+```
+
 
 filter only full stained
 
@@ -181,27 +222,27 @@ Use `scater` for exploratory data analysis.
 
 PCA:
 ````{r}
-sce_full_stained <- runPCA(sce_full_stained, exprs_values = "tfmfeatures")
-plotReducedDim(sce_full_stained, dimred = "PCA", colour_by = "Patient")
-plotReducedDim(sce_full_stained, dimred = "PCA", colour_by = "Treatment")
+sce <- runPCA(sce, exprs_values = "tfmfeatures")
+plotReducedDim(sce, dimred = "PCA", colour_by = "Disease")
+plotReducedDim(sce, dimred = "PCA", colour_by = "Treatment")
 
 ```
 Custom plots using `ggcells` function.
 
 ```{r}
-plotReducedDim(sce_full_stained, dimred = "PCA", colour_by = "Treatment")
-    ggcells(sce_full_stained, aes(x = PCA.3, y = PCA.4, color = Treatment)) +
+plotReducedDim(sce, dimred = "PCA", colour_by = "Treatment")
+    ggcells(sce, aes(x = PCA.2, y = PCA.3, color = Treatment)) +
       geom_point() +
       theme_minimal() +
-      labs(title = "PCA: PC3 vs PC4", x = "PC3", y = "PC4")
+      labs(title = "PCA: PC2 vs PC3", x = "PC2", y = "PC3")
 ```
 
 UMAP:
 
 ```{r}
-sce_full_stained <- runUMAP(sce_full_stained, exprs_values = "tfmfeatures")
-plotReducedDim(sce_full_stained, dimred = "UMAP", colour_by = "Disease")
-plotReducedDim(sce_full_stained, dimred = "UMAP", colour_by = "Treatment")
+sce <- runUMAP(sce, exprs_values = "tfmfeatures")
+plotReducedDim(sce, dimred = "UMAP", colour_by = "Disease")
+plotReducedDim(sce, dimred = "UMAP", colour_by = "Treatment")
 ```
 
 Faster clustering:
@@ -210,8 +251,8 @@ Faster clustering:
 set.seed(23)
 kgraph.clusters <- clusterCells(sce_full_stained, use.dimred = "PCA",
     BLUSPARAM = TwoStepParam(
-        first = KmeansParam(centers = 20),
-        second = SNNGraphParam(k = 5, type = "rank", cluster.fun = "walktrap")
+        first = KmeansParam(centers = 2),
+        second = SNNGraphParam(k = 2, type = "rank", cluster.fun = "walktrap")
     )
 )
 table(kgraph.clusters)
@@ -225,7 +266,7 @@ plotReducedDim(sce_full_stained, "UMAP", colour_by = "label")
 Train machine learning models on multiple perturbations.
 
 ```{r}
-interest <- setdiff(unique(sce_full_stained$Treatment), c("cont"))
+interest <- setdiff(unique(sce$Treatment), c("cont"))
 result_list <- lapply(interest, function(level) {
   fitModel(sce, 
            target = "Treatment", 
