@@ -96,6 +96,8 @@ df_mean <- df %>%
   summarize(Mean_Intensity = mean(nucleus_Intensity_MeanIntensity_CorrEdU, na.rm = TRUE)) %>%
   ungroup()
 
+
+
 ```
 
 Plot for specific feature
@@ -281,3 +283,241 @@ ggplot(subset(df, EdU_Status == "EdU ≤ 0.15"),
 prepare data for H2AX and pp38
 
 ````{r}
+
+#Define Well Patterns for Each Marker
+
+h2ax_wells <- c(
+  paste0(LETTERS[2:7], "02"),  # B02, C02, ..., G02
+  paste0(LETTERS[2:7], "03"),  # B03, C03, ..., G03
+  paste0(LETTERS[2:7], "06"),  # B06, C06, ..., G06
+  paste0(LETTERS[2:7], "07")   # B07, C07, ..., G07
+)
+
+#Add marker_type Metadata to colData
+colData(sce)$marker_type <- ifelse(
+  colData(sce)$Well %in% h2ax_wells,
+  "H2AX",
+  "pp38"
+) %>% factor(levels = c("H2AX", "pp38"))
+
+# Check well-to-marker mapping
+table(colData(sce)$Well, colData(sce)$marker_type)
+
+# Count cells per marker type
+summary(colData(sce)$marker_type)
+
+#Subset by Marker
+sce_h2ax <- sce[, colData(sce)$marker_type == "H2AX"]
+sce_pp38 <- sce[, colData(sce)$marker_type == "pp38"]
+
+```
+filter for Intensity in 488 (pp38 and h2ax)
+
+````{r}
+###########for h2ax
+feature_names <- rownames(sce_h2ax)
+
+#see all intensity feature name
+intensity_features <- grep("Intensity", feature_names, value = TRUE)
+print(intensity_features)
+
+# Extract intensity-related feature names
+intensity_features <- grep("Intensity", feature_names, value = TRUE)
+
+# Transpose the assay data and convert to a data frame
+intensity_data <- as.data.frame(t(assay(sce_h2ax, "features"))) # change back to "tfmfeatures" if work with logtransform in above step
+
+# Subset intensity_data to keep only intensity-related columns
+intensity_data <- intensity_data[, intensity_features, drop = FALSE]
+
+
+# Extract metadata from colData
+metadata <- as.data.frame(colData(sce_h2ax)[, c("Patient", "Treatment", "Disease")])  # Replace with correct column names
+
+# Combine metadata with intensity data
+df <- cbind(metadata, intensity_data)
+
+df_mean <- df %>%
+  group_by(Patient, Disease, Treatment) %>%
+  summarize(Mean_Intensity = mean(nucleus_Intensity_MeanIntensity_Corr488, na.rm = TRUE)) %>%
+  ungroup()
+
+```
+plot to see feature
+
+````{r}
+
+ggplot(df_mean, aes(x = Treatment, y = Mean_Intensity)) +
+  geom_boxplot(aes(fill = Disease), alpha = 0.7, outlier.shape = NA) +  # Box plot
+  geom_jitter(width = 0.2, size = 3, alpha = 0.7) +  # Dots for each patient's mean intensity
+  facet_wrap(~ Disease, nrow = 1)  # Facet by Treatment
+  labs(
+    title = "nucleus_MeanIntensity_H2AX by Disease and Treatment",
+    x = "Disease",
+    y = "Mean nucleusIntensity_H2AX",
+    fill = "Disease"  # Legend for box plot fill
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 14),  # Increase general text size
+    axis.text.x = element_text(size = 12, angle = 45, hjust = 1),  # Increase x-axis label size and rotate
+    axis.text.y = element_text(size = 12),  # Increase y-axis label size
+    axis.title.x = element_text(size = 14),  # Increase x-axis title size
+    axis.title.y = element_text(size = 14),  # Increase y-axis title size
+    plot.title = element_text(size = 16, face = "bold"),  # Increase plot title size and make it bold
+    strip.text = element_text(size = 14)  # Increase facet label size
+  )
+
+```
+
+````{r}
+###########for pp38
+feature_names <- rownames(sce_pp38)
+
+#see all intensity feature name
+intensity_features <- grep("Intensity", feature_names, value = TRUE)
+print(intensity_features)
+
+# Extract intensity-related feature names
+intensity_features <- grep("Intensity", feature_names, value = TRUE)
+
+# Transpose the assay data and convert to a data frame
+intensity_data <- as.data.frame(t(assay(sce_pp38, "features"))) # change back to "tfmfeatures" if work with logtransform in above step
+
+# Subset intensity_data to keep only intensity-related columns
+intensity_data <- intensity_data[, intensity_features, drop = FALSE]
+
+
+# Extract metadata from colData
+metadata <- as.data.frame(colData(sce_pp38)[, c("Patient", "Treatment", "Disease")])  # Replace with correct column names
+
+# Combine metadata with intensity data
+df <- cbind(metadata, intensity_data)
+
+df_mean <- df %>%
+  group_by(Patient, Disease, Treatment) %>%
+  summarize(Mean_Intensity = mean(nucleus_Intensity_MeanIntensity_Corr488, na.rm = TRUE)) %>%
+  ungroup()
+
+```
+plot to see feature
+
+````{r}
+
+ggplot(df_mean, aes(x = Disease, y = Mean_Intensity)) +
+  geom_boxplot(aes(fill = Disease), alpha = 0.7, outlier.shape = NA) +  # Box plot
+  geom_jitter(width = 0.2, size = 3, alpha = 0.7) +  # Dots for each patient's mean intensity
+  facet_wrap(~ Treatment) +  # Facet by Treatment
+  labs(
+    title = "nucleus_MeanIntensity_pp38 by Disease and Treatment",
+    x = "Disease",
+    y = "Mean nucleus_Intensity_pp38",
+    fill = "Disease"  # Legend for box plot fill
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 14),  # Increase general text size
+    axis.text.x = element_text(size = 12, angle = 45, hjust = 1),  # Increase x-axis label size and rotate
+    axis.text.y = element_text(size = 12),  # Increase y-axis label size
+    axis.title.x = element_text(size = 14),  # Increase x-axis title size
+    axis.title.y = element_text(size = 14),  # Increase y-axis title size
+    plot.title = element_text(size = 16, face = "bold"),  # Increase plot title size and make it bold
+    strip.text = element_text(size = 14)  # Increase facet label size
+  )
+
+```
+N to C ratio pp38
+
+````{r}
+# Calculate the ratio
+df_nc <- df %>%
+  mutate(Ratio = nucleus_Intensity_MeanIntensity_Corr488 / cyto_Intensity_MeanIntensity_Corr488)
+
+# Create the plot
+ggplot(df_nc, aes(x = Ratio, fill = Treatment)) +
+  geom_histogram(aes(y = after_stat(density)), alpha = 0.5, position = "identity", bins = 30) +  # Overlay histograms
+  facet_grid(Treatment ~ Disease) +  # Each treatment in a row, diseases in columns
+  labs(
+    title = "Ratio of nucleus_Intensity_MeanIntensity_pp38 to cyto_Intensity_MeanIntensity_pp38",
+    x = "Ratio (Nucleus/Cyto)",
+    y = "Density",
+    fill = "Treatment"  # Legend for Treatment
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 14),  # Increase general text size
+    axis.text.x = element_text(size = 12, angle = 45, hjust = 1),  # Increase x-axis label size and rotate
+    axis.text.y = element_text(size = 12),  # Increase y-axis label size
+    axis.title.x = element_text(size = 14),  # Increase x-axis title size
+    axis.title.y = element_text(size = 14),  # Increase y-axis title size
+    plot.title = element_text(size = 16, face = "bold"),  # Increase plot title size and make it bold
+    strip.text = element_text(size = 14)  # Increase facet label size
+  )
+
+```
+Calculate Percentages Above Cutoff (from NC ratio curve)
+
+````{r}
+df_stats <- df_nc %>% 
+  group_by(Treatment, Disease, Patient) %>%  # Include Patient for replicates
+  summarise(
+    percent_above = 100 * mean(Ratio > 1.2),  # % cells > 1.2 per patient
+    .groups = "drop"
+  )
+
+# View the calculated stats
+print(df_stats)
+
+df_summary <- df_stats %>% 
+  group_by(Treatment, Disease) %>% 
+  summarise(
+    mean = mean(percent_above),
+    sd = sd(percent_above),  # Now valid (SD across patients)
+    n = n(),  # Number of patients
+    se = sd / sqrt(n),  # Standard error (optional)
+    .groups = "drop"
+  )
+
+# View results
+print(df_summary, n = Inf)
+
+
+
+#Boxplot of Percentages
+
+ggplot(df_stats, aes(x = Treatment, y = percent_above, fill = Treatment)) +
+  geom_boxplot(width = 0.6, outlier.shape = NA) +
+  geom_jitter(width = 0.1, size = 3, alpha = 0.8) +  # Show individual points
+  facet_wrap(~ Disease, nrow = 1) +                 # Horizontal disease facets
+  geom_hline(yintercept = 0, linetype = "dashed") + # Reference line at 0%
+  labs(
+    title = "Percentage of Cells with Nucleus/Cyto pp38 Ratio > 1.2",
+    y = "% Cells Above Cutoff",
+    x = NULL
+  ) +
+  scale_fill_brewer(palette = "Set2")+
+  theme_minimal() +
+  theme(
+    text = element_text(size = 14),  # Increase general text size
+    axis.text.x = element_text(size = 12, angle = 45, hjust = 1),  # Increase x-axis label size and rotate
+    axis.text.y = element_text(size = 12),  # Increase y-axis label size
+    axis.title.x = element_text(size = 14),  # Increase x-axis title size
+    axis.title.y = element_text(size = 14),  # Increase y-axis title size
+    plot.title = element_text(size = 16, face = "bold"),  # Increase plot title size and make it bold
+    strip.text = element_text(size = 14)  # Increase facet label size
+  )
+
+
+
+#Bar plot of Percentages +SD
+
+ggplot(df_summary, aes(x = Treatment, y = mean, fill = Treatment)) +
+  geom_col(position = position_dodge(0.8), width = 0.7) +
+  geom_errorbar(
+    aes(ymin = mean - sd, ymax = mean + sd),
+    width = 0.2,
+    position = position_dodge(0.8)
+  ) +
+  facet_wrap(~ Disease) +
+  labs(y = "% Cells > 1.2")
+
