@@ -36,12 +36,7 @@ sce <- sce[, -cell_ids]
 sce <- removeLowVariance(sce)
 sce <- transformLogScale(sce)
 
-plotCellsPerImage(sce)
-sce <- removeOutliers(sce, min = 10, max = 300)
- 
- 
-sce <- removeLowVariance(sce)
-sce <- transformLogScale(sce)
+
 ```
 
 ```{r}
@@ -266,14 +261,18 @@ plotReducedDim(sce_full_stained, "UMAP", colour_by = "label")
 Train machine learning models on multiple perturbations.
 
 ```{r}
-interest <- setdiff(unique(sce$Treatment), c("cont"))
+interest <- setdiff(unique(sce$Treatment), c("control"))
+sce$Treatment <- as.factor(sce$Treatment)
+sce$Treatment <- droplevels(sce$Treatment)
+
 result_list <- lapply(interest, function(level) {
   fitModel(sce, 
            target = "Treatment", 
-           interest_level = level, reference_level = "cont", 
+           interest_level = level, reference_level = "control", 
            group = "Patient", strata = c("Disease"), 
            n_folds = 20, n_threads = 8)
 })
+
 ```
 
 Plot AUC comparison between perturbations.
