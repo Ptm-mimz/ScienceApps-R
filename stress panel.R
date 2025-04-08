@@ -266,18 +266,28 @@ sce$Treatment <- as.factor(sce$Treatment)
 sce$Treatment <- droplevels(sce$Treatment)
 
 result_list <- lapply(interest, function(level) {
-  fitModel(sce, 
-           target = "Treatment", 
-           interest_level = level, reference_level = "control", 
-           group = "Patient", strata = c("Disease"), 
+  fitModel(sce,
+           target = "Treatment",
+           interest_level = level, reference_level = "control",
+           group = "Patient", strata = c("Disease"),
            n_folds = 20, n_threads = 8)
 })
+
+##test diff if panel can distinguish between disease
+
+sce_TNF <- sce[, sce$Treatment == "TNF"]
+ 
+result <- fitModel(sce_TNF,
+                   target = "Disease", 
+                   interest_level = "OA", reference_level = "healthy", 
+                   group = "Patient", strata = "Disease",
+                   n_folds = 20, n_threads = 8)
 
 ```
 
 Plot AUC comparison between perturbations.
 
 ```{r}
-plotAUC(result_list)
+plotAUC(result)
 ```
 
