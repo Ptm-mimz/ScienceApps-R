@@ -22,49 +22,101 @@ sce <- loadData(file_plate)
 ```
 
 ## Data Transformation
-```{r}
-plotCellsPerImage(sce)
-sce <- removeOutliers(sce, min = 10, max = 300)
 
-#sce <- removeMissingValues(sce)
+Prepare the data for machine learning.
+```{r}
+# fix plate id
+sce$Plate <- unique(sce$Patient)[1]
+ 
 # remove missing values in cells
 mat <- assay(sce, name = "features")
-miss_perc_cells <- apply(mat, 2, function(x) mean(is.na(x)))
-cell_ids <- which(miss_perc_cells > 0)
+miss_cells <- apply(mat, 2, function(x) sum(is.na(x)))
+cell_ids <- which(miss_cells > 0)
 sce <- sce[, -cell_ids]
-
-sce <- removeLowVariance(sce)
-sce <- transformLogScale(sce)
-
+ 
+# define reference level
+sce$Treatment <- as.factor(sce$Treatment)
+sce$Treatment <- relevel(sce$Treatment, ref = "control")
+ 
+# batch correct and normalize features
+sce <- normalizeExclude(sce)
+ 
+# remove outliers
+plotCellsPerImage(sce)
+sce <- removeOutliers(sce, min = 20, max = 500)
 
 ```
+flter Intensity data
 
 ```{r}
-# sce1 <- sce
-sce <- sce1
+#EXTRACT NORMALISED FEATURES
+mat <- assay(sce, "features")
 
-#if I want to delete feature that has 0 value
-mat <- assay(sce, name = "features")
-miss_perc_features <- apply(mat, 1, function(x) mean(is.na(x)))
-feature_ids <- which(miss_perc_features > 0)
-sce <- sce[-feature_ids,]
+#Get only 'Intensity' features
+intensity_features <- grep("^Intensity_", rownames(mat), value = TRUE)
+mat_intensity <- mat[intensity_features, ]
 
-###############################################################################
+#transpose for PCA
+mat_pca <- t(mat_intensity)
 
+#run PCA
+pca <- prcomp(mat_pca, scale. = TRUE)
 
-#if I want to delete cell that has 0 value, but keep feature data
-mat <- assay(sce, name = "features")
-miss_perc_cells <- apply(mat, 2, function(x) mean(is.na(x)))
-cell_ids <- which(miss_perc_cells > 0)
-sce <- sce[, -cell_ids]
+# Calculate % variance for each PC
+percentVar <- pca$sdev^2 / sum(pca$sdev^2) * 100
+pc1_label <- paste0("PC1 (", round(percentVar[1], 1), "%)")
+pc2_label <- paste0("PC2 (", round(percentVar[2], 1), "%)")
 
-###############################################################################
+#plot PCA
+pca_df <- as.data.frame(pca$x)
+pca_df$Treatment <- sce$Treatment  # add metadata if needed
 
-sce <- removeLowVariance(sce)
-sce <- transformLogScale(sce)
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Treatment)) +
+  geom_point(alpha = 0.3, size = 1.5) +
+  theme_minimal() +
+  labs(
+    title = "PCA of Intensity Features",
+    x = pc1_label,
+    y = pc2_label
+  ) +
+  theme(
+    legend.title = element_blank(),
+    plot.title = element_text(hjust = 0.5)
+  )
 
 ```
+UMAp from Intensity data
 
+```{r}
+
+library(uwot)
+
+mat_umap <- t(mat_intensity)
+
+set.seed(42)  # for reproducibility
+umap_result <- umap(mat_umap, n_neighbors = 15, min_dist = 0.1, metric = "euclidean")
+
+#plot UMAP
+umap_df <- as.data.frame(umap_result)
+colnames(umap_df) <- c("UMAP1", "UMAP2")
+umap_df$Treatment <- sce$Treatment
+
+
+ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = Treatment)) +
+  geom_point(alpha = 0.3, size = 1.5) +
+  facet_wrap(~ Treatment) +
+  theme_minimal() +
+  labs(
+    title = "UMAP of Intensity Features",
+    x = "UMAP1",
+    y = "UMAP2"
+  ) +
+  theme(
+    legend.title = element_blank(),
+    plot.title = element_text(hjust = 0.5)
+  )
+
+```
 
 filter only full stained
 
@@ -94,7 +146,7 @@ print(intensity_features)
 
 
 # Extract intensity features from the assay slot
-intensity_data <- as.data.frame(t(assay(sce_full_stained, "features")))  # change back to "tfmfeatures" if work with logtransform in above step
+intensity_data <- as.data.frame(t(assay(sce, "tfmfeatures")))  # change back to "tfmfeatures" if work with logtransform in above step
 
 # Filter for columns that start with "Intensity"
 intensity_features <- grep("^Intensity", colnames(intensity_data), value = TRUE)
@@ -109,7 +161,7 @@ intensity_data <- intensity_data[, c("Intensity_MeanIntensity_CorrLyso",
 
 
 # Extract metadata from colData
-metadata <- as.data.frame(colData(sce_full_stained)[, c("Patient", "Treatment", "Disease")])  # Replace with correct column names
+metadata <- as.data.frame(colData(sce)[, c("Patient", "Treatment", "Disease")])  # Replace with correct column names
 
 # Combine metadata with intensity data
 df <- cbind(metadata, intensity_data)
@@ -128,6 +180,7 @@ df_aggregated <- df_long %>%
   ungroup()
 
 ````
+
 
 # Create the box plot
 
@@ -216,12 +269,16 @@ ggplot(df_aggregated, aes(x = Treatment, y = Intensity, fill = Treatment)) +
 Use `scater` for exploratory data analysis.
 
 PCA:
-````{r}
-sce <- runPCA(sce, exprs_values = "tfmfeatures")
-plotReducedDim(sce, dimred = "PCA", colour_by = "Disease")
-plotReducedDim(sce, dimred = "PCA", colour_by = "Treatment")
 
+```{r}
+
+sce <- runPCA(sce, exprs_values = "tfmfeatures")
+plotReducedDim(sce, dimred = "PCA", colour_by = "Patient")
+plotReducedDim(sce, dimred = "PCA", colour_by = "Treatment")
+plotPCACor(sce, filter_by = 1, top = 20)
+plotPCACor(sce, filter_by = 2, top = 20)
 ```
+
 Custom plots using `ggcells` function.
 
 ```{r}
@@ -236,7 +293,7 @@ UMAP:
 
 ```{r}
 sce <- runUMAP(sce, exprs_values = "tfmfeatures")
-plotReducedDim(sce, dimred = "UMAP", colour_by = "Disease")
+plotReducedDim(sce, dimred = "UMAP", colour_by = "Patient")
 plotReducedDim(sce, dimred = "UMAP", colour_by = "Treatment")
 ```
 
@@ -273,21 +330,46 @@ result_list <- lapply(interest, function(level) {
            n_folds = 20, n_threads = 8)
 })
 
+plotAUC(result_list)
+
+
 ##test diff if panel can distinguish between disease
 
-sce_TNF <- sce[, sce$Treatment == "TNF"]
+sce_cont <- sce[, sce$Treatment == "control"]
  
-result <- fitModel(sce_TNF,
+result <- fitModel(sce_cont,
                    target = "Disease", 
-                   interest_level = "OA", reference_level = "healthy", 
+                   interest_level = "RA", reference_level = "Healthy", 
                    group = "Patient", strata = "Disease",
                    n_folds = 20, n_threads = 8)
 
+
+
+#in healthy with treatment _ how does it look?
+sce_healthy <- sce[, sce$Disease == "healthy"]
+ 
+result <- fitModel(sce_healthy,
+                   target = "Treatment", 
+                   interest_level = "PIC", reference_level = "control", 
+                   group = "Patient", strata = "Disease",
+                   n_folds = 20, n_threads = 8)
 ```
 
 Plot AUC comparison between perturbations.
 
 ```{r}
-plotAUC(result)
-```
+plotROC(result)
 
+```
+Check sample info of individual curves.
+
+```{r}
+# identify fold id
+plotROC(result) + 
+  facet_wrap(~fold) + # plot each curves on separate facet
+  geom_path(alpha = 1.0) # for better visibility
+
+# print sample info for one fold
+printROC(result, 11)
+
+```
