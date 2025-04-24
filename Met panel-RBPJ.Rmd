@@ -1,0 +1,342 @@
+```{r}
+library(cellpaintr)
+library(ggplot2)
+library(scater)
+library(scran)
+library(bluster)
+library(tidyr)
+library(dplyr)
+library(uwot)
+library(ggpubr)
+```
+
+# path to files
+
+```{r}
+
+file_plate <- paste0(
+  "/scratch/plapha/250410 metabolism_RBPJ/output/",
+  "MyExpt_Cells.csv"
+)
+
+sce <- loadData(file_plate)
+
+```
+## Data Transformation
+
+Prepare the data for machine learning.
+
+```{r}
+# fix plate id
+sce$Plate <- unique(sce$Patient)[1]
+ 
+# remove missing values in cells
+mat <- assay(sce, name = "features")
+miss_cells <- apply(mat, 2, function(x) sum(is.na(x)))
+cell_ids <- which(miss_cells > 0)
+sce <- sce[, -cell_ids]
+ 
+# define reference level
+sce$Treatment <- as.factor(sce$Treatment)
+sce$Treatment <- relevel(sce$Treatment, ref = "cont")
+ 
+# batch correct and normalize features
+sce <- normalizeExclude(sce)
+ 
+plotCellsPerImage(sce)
+sce <- removeOutliers(sce, min = 20, max = 100)
+
+```
+
+## Unsupervised Analysis
+
+Use `scater` for exploratory data analysis.
+
+PCA:
+
+```{r}
+sce <- runPCA(sce, exprs_values = "tfmfeatures")
+plotReducedDim(sce, dimred = "PCA", colour_by = "Patient")
+plotReducedDim(sce, dimred = "PCA", colour_by = "Treatment")
+plotPCACor(sce, filter_by = 1, top = 20)
+plotPCACor(sce, filter_by = 2, top = 20)
+
+```
+UMAP:
+
+```{r}
+sce <- runUMAP(sce, exprs_values = "tfmfeatures")
+plotReducedDim(sce, dimred = "UMAP", colour_by = "Patient")
+plotReducedDim(sce, dimred = "UMAP", colour_by = "Treatment")
+
+```
+flter only Intensity data
+
+```{r}
+#EXTRACT NORMALISED FEATURES
+mat <- assay(sce, "features")
+
+#Get only 'Intensity' features
+intensity_features <- grep("^Intensity_", rownames(mat), value = TRUE)
+mat_intensity <- mat[intensity_features, ]
+
+#transpose for PCA
+mat_pca <- t(mat_intensity)
+
+#run PCA
+pca <- prcomp(mat_pca, scale. = TRUE)
+
+# Calculate % variance for each PC
+percentVar <- pca$sdev^2 / sum(pca$sdev^2) * 100
+pc1_label <- paste0("PC1 (", round(percentVar[1], 1), "%)")
+pc2_label <- paste0("PC2 (", round(percentVar[2], 1), "%)")
+
+#plot PCA
+pca_df <- as.data.frame(pca$x)
+pca_df$Treatment <- sce$Treatment  # add metadata if needed
+
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Treatment)) +
+  geom_point(alpha = 0.3, size = 1.5) +
+  theme_minimal() +
+  labs(
+    title = "PCA of Intensity Features",
+    x = pc1_label,
+    y = pc2_label
+  ) +
+  theme(
+    legend.title = element_blank(),
+    plot.title = element_text(hjust = 0.5)
+  )
+
+```
+UMAp from Intensity data
+
+```{r}
+
+
+mat_umap <- t(mat_intensity)
+
+set.seed(42)  # for reproducibility
+umap_result <- umap(mat_umap, n_neighbors = 15, min_dist = 0.1, metric = "euclidean")
+
+#plot UMAP
+umap_df <- as.data.frame(umap_result)
+colnames(umap_df) <- c("UMAP1", "UMAP2")
+umap_df$Treatment <- sce$Treatment
+umap_df$Patient <- sce$Patient
+
+ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = Treatment)) +
+  geom_point(alpha = 0.3, size = 1.5) +
+  facet_wrap(~ Patient) +
+  theme_minimal() +
+  labs(
+    title = "UMAP of Intensity Features",
+    x = "UMAP1",
+    y = "UMAP2"
+  ) +
+  theme(
+    legend.title = element_blank(),
+    plot.title = element_text(hjust = 0.5)
+  )
+
+```
+## Fit Single Model from all features
+
+
+Train machine learning model on one perturbation.
+
+```{r}
+result <- fitModel(sce,
+                   target = "Treatment", 
+                   interest_level = "RBPJ", reference_level = "cont", 
+                   group = "Patient", strata = c("Disease"), 
+                   n_folds = 20, n_threads = 8)
+
+
+##test diff if panel can distinguish between disease
+
+sce_RBPJ <- sce[, sce$Treatment == "RBPJ"]
+ 
+result <- fitModel(sce_RBPJ,
+                   target = "Disease", 
+                   interest_level = "RA", reference_level = "Healthy", 
+                   group = "Patient", strata = "Disease",
+                   n_folds = 20, n_threads = 8)
+
+```
+
+Plot ROC curves.
+
+```{r}
+plotROC(result)
+
+```
+plot specific feature
+
+```{r}
+# 1. Extract metadata and intensity values
+meta_data <- as.data.frame(colData(sce))
+intensity_values <- mat_intensity["Intensity_MeanIntensity_CorrEdU", ]
+
+# 2. Convert to a numeric vector (in case it's stored differently)
+intensity_values <- as.numeric(intensity_values)
+
+# 3. Create a data frame for plotting
+plot_data <- data.frame(Intensity = intensity_values)
+
+# 4. Plot using ggplot2 (set cut-off at 0.001)
+
+ggplot(data.frame(Intensity = intensity_values), aes(x = Intensity)) +
+  geom_histogram(fill = "skyblue", color = "black", bins = 30) +
+  geom_vline(xintercept = 0.001, color = "red", linetype = "dashed", linewidth = 1) +  # Add vertical line
+  ggtitle("Histogram of Intensity_MeanIntensity_CorrEdU") +
+  xlab("Intensity Value") +
+  ylab("Frequency") +
+  theme_minimal()
+
+#5. plot percentage
+# Combine into a data frame
+plot_data <- data.frame(
+  Patient = meta_data$Patient,
+  Treatment = meta_data$Treatment,
+  Intensity = intensity_values
+)
+
+# Calculate % cells > 0.001 per Patient-Treatment group
+summary_data <- plot_data %>%
+  group_by(Patient, Treatment) %>%
+  summarise(
+    Percent_Above = 100 * mean(Intensity > 0.001),
+    .groups = "drop"
+  )
+
+# plot
+ggplot(summary_data, aes(x = Treatment, y = Percent_Above, color = Patient, group = Patient)) +
+    geom_point(size = 3) +
+    geom_line() +
+    labs(
+        title = "% Cells with Intensity > 0.001",
+        y = "% Cells Above Threshold",
+        x = "Treatment"
+    ) +
+    theme_minimal()
+
+#test stat
+## paired t-test
+# Convert to wide format (one row per Patient, columns for each Treatment)
+wide_data <- summary_data %>%
+  pivot_wider(
+    names_from = Treatment, 
+    values_from = Percent_Above
+  )
+
+# Check structure (replace "TreatmentA" and "TreatmentB" with actual names)
+head(wide_data)
+
+t_test_result <- t.test(
+     wide_data$cont,  # Replace with actual column names
+     wide_data$RBPJ,
+     paired = TRUE          # Now works!
+ )
+ t_test_result
+ 
+ 
+```
+Explore Lipid feature
+
+```{r}
+
+lipid_intensity <- as.numeric(mat_intensity["Intensity_MeanIntensity_CorrLipid", ])
+
+plot_data <- data.frame(
+  Patient = meta_data$Patient,
+  Treatment = meta_data$Treatment,
+  Lipid_Intensity = lipid_intensity
+) %>%
+  filter(!is.na(Lipid_Intensity))
+
+
+ggplot(plot_data, aes(x = Lipid_Intensity, fill = Patient)) +
+    geom_histogram(color = "black", bins = 30, alpha = 0.7, position = "identity") +
+    geom_vline(xintercept = 0.095, color = "red", linetype = "dashed", linewidth = 1) +
+    facet_wrap(~ Treatment, scales = "free") +  # Facet by Treatment
+    labs(
+        title = "Histogram of Lipid Intensity (Threshold = 0.001)",
+        x = "Lipid Intensity Value",
+        y = "Frequency"
+    ) +
+    theme_minimal() +
+    theme(
+        legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, hjust = 1)
+    )
+
+# 1. Calculate % above threshold for each Patient-Treatment group
+percent_data <- plot_data %>%
+  group_by(Patient, Treatment) %>%
+  summarise(
+    Percent_Above = 100 * mean(Lipid_Intensity > 0.095),
+    .groups = "drop"
+  )
+
+# 2. Plot lines connecting Treatments for each Patient
+ggplot(percent_data, aes(x = Treatment, y = Percent_Above, 
+                         group = Patient, color = Patient)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  labs(
+    title = "% Cells with Lipid Intensity > 0.095",
+    y = "% Cells Above Threshold",
+    x = "Treatment"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  # Optional: Add mean difference p-value
+  stat_compare_means(
+    aes(group = Patient), 
+    method = "t.test", 
+    paired = TRUE,
+    label = "p.signif",
+    label.y = max(percent_data$Percent_Above) * 1.1
+  )
+
+ 
+```
+Explore MitoSOX feature
+
+```{r}
+sox_intensity <- as.numeric(mat_intensity["Intensity_MeanIntensity_CorrMitosox", ])
+
+plot_data <- data.frame(
+  Patient = meta_data$Patient,
+  Treatment = meta_data$Treatment,
+  Sox_Intensity = sox_intensity
+) %>%
+  filter(!is.na(Sox_Intensity))
+
+
+ggplot(plot_data, aes(x = Sox_Intensity, fill = Patient)) +
+    geom_histogram(color = "black", bins = 30, alpha = 0.7, position = "identity") +
+    geom_vline(xintercept = 0.08, color = "red", linetype = "dashed", linewidth = 1) +
+    facet_wrap(~ Treatment, scales = "free") +  # Facet by Treatment
+    labs(
+        title = "Histogram of MitoSOX Intensity",
+        x = "MitoSOX Intensity Value",
+        y = "Frequency"
+    ) +
+    theme_minimal() +
+    theme(
+        legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, hjust = 1)
+    )
+
+# 1. Calculate % above threshold for each Patient-Treatment group
+percent_data <- plot_data %>%
+  group_by(Patient, Treatment) %>%
+  summarise(
+    Percent_Above = 100 * mean(Sox_Intensity > 0.08),
+    .groups = "drop"
+  )
