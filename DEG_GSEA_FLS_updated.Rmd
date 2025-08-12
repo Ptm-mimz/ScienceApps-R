@@ -1,0 +1,489 @@
+GSEA analysis
+Author: Mim & Ege
+User and modify : Mim
+18/07/2025
+
+```{r}
+
+#install.packages("HGNChelper")
+library(dplyr)
+library(tibble)
+library(clusterProfiler)
+library(enrichplot)
+library(ggplot2)
+library(forcats)
+library(tidyverse)
+library(DESeq2)
+library(biomaRt)
+library(HGNChelper) #they want citation
+library(fgsea)
+library(envalysis)
+library(ggpubr)
+library(org.Hs.eg.db) 
+library(readxl)
+
+```
+
+###For enrichment analysis to autophagy, lipid metabolism etc. using deg from Tsuchiya et al. paper
+
+Prepare the data for biological terms
+
+```{r}
+#Load raw file
+    setwd("/data/plapha/Gene expression_healthy RA OA")
+
+#cytokine_data <- readRDS("ra_de_list_only_expressed_genes.rds")
+#cytokine_data <- readRDS("~/Desktop/PhD/2024 First Term/RNA Sequencing from Tsuchiya et al./ra_de_list_only_expressed_genes.rds")
+
+##for healthy vs RA analysis
+df <- read_excel("/data/plapha/Gene expression_healthy RA OA/results_vs_healthy_vs_ra.xlsx")
+
+#names(cytokine_data)
+names(df)
+
+```
+#Load new gene sets --> only express in Fibroblast (cutoff 100 from expression file)
+
+```{r}
+Fib_gene_sets <- readRDS("fib_gene_sets_cut10.rds")
+#Fib_gene_sets <- readRDS("fib_gene_sets_cut100.rds")
+
+```
+#read the deg from stimulations and cross-check if all the genes in our gene sets are represented in the deg file
+
+```{r}
+
+#for a specific cytokine:
+IFNg_data <- cytokine_data$IFNg 
+TNFa_data <- cytokine_data$TNFa
+IL1b_data <- cytokine_data$IL1b
+IL6_data <- cytokine_data$IL6
+  
+# check the coverage of deg genes to gene list we have
+deg_genes <- unique(IFNg_data$genename)
+coverage_check <- lapply(Fib_gene_sets, function(genes) {
+  present <- genes %in% deg_genes
+  list(
+    present_genes = genes[present],
+    missing_genes = genes[!present],
+    n_present = sum(present),
+    n_missing = sum(!present)
+  )
+})
+
+
+#check the coverage
+sapply(coverage_check, function(x) c(present = x$n_present, missing = x$n_missing))
+#there is a huge discrepancy between degs and gene sets
+
+#we replace the the names with the hgnc codes from deg and check the coverage again
+IFNg_data$hgnc_name <- checkGeneSymbols(IFNg_data$genename)$Suggested.Symbol
+deg_genes_updated <- unique(IFNg_data$hgnc_name)
+coverage_check <- lapply(Fib_gene_sets, function(genes) {
+  present <- genes %in% deg_genes_updated
+  list(
+    present_genes = genes[present],
+    missing_genes = genes[!present],
+    n_present = sum(present),
+    n_missing = sum(!present)
+  )
+})
+sapply(coverage_check, function(x) c(present = x$n_present, missing = x$n_missing))
+
+#now it looks so much better!
+
+##for healthy vs RA analysis
+deg_genes <- unique(df$gene)
+coverage_check <- lapply(Fib_gene_sets, function(genes) {
+  present <- genes %in% deg_genes
+  list(
+    present_genes = genes[present],
+    missing_genes = genes[!present],
+    n_present = sum(present),
+    n_missing = sum(!present)
+  )
+})
+#we replace the the names with the hgnc codes from deg and check the coverage again
+df$hgnc_name <- checkGeneSymbols(df$gene)$Suggested.Symbol
+deg_genes_updated <- unique(df$hgnc_name)
+coverage_check <- lapply(Fib_gene_sets, function(genes) {
+  present <- genes %in% deg_genes_updated
+  list(
+    present_genes = genes[present],
+    missing_genes = genes[!present],
+    n_present = sum(present),
+    n_missing = sum(!present)
+  )
+})
+sapply(coverage_check, function(x) c(present = x$n_present, missing = x$n_missing))
+
+
+```
+
+#prepare gsea input
+
+```{r}
+#we will filter the ones that doesnt have hgnc names (undefined transcripts) and the ones that dont have lfc 
+valid_genes <- !is.na(IFNg_data$hgnc_name) & !is.na(IFNg_data$log2FoldChange)
+
+IFNg_data_updated <- IFNg_data[valid_genes_x,]
+
+unique_genes <- unique(IFNg_data_updated$hgnc_name) 
+cat("IFNg dataframe after filtration number of genes:", nrow(IFNg_data_updated), 
+    "\nNumber of unique hgnc symbols in the filtered dataframe:", length(unique_genes), "\n",
+    "The difference between them:", nrow(IFNg_data_updated)- length(unique_genes))
+
+#now we will check if these genes with more than one entry is represented in our gene set
+duplicated_genes <- IFNg_data_updated$hgnc_name[duplicated(IFNg_data_updated$hgnc_name)]
+duplicated_genes <- unique(duplicated_genes)
+
+coverage_check <- lapply(Fib_gene_sets, function(genes) {
+  present <- genes %in% duplicated_genes
+  list(
+    present_genes = genes[present],
+    missing_genes = genes[!present],
+    n_present = sum(present),
+    n_missing = sum(!present)
+  )
+})
+sapply(coverage_check, function(x) c(present = x$n_present, missing = x$n_missing))
+#they are not covered in gene_set so we dont care about them
+
+#for GSEA we can use use both approaches -> signed p values or shrunken LFC (I have already shrunken them before doing deseq2 deg analysis)
+
+#the lfc rank
+IFNg_ranks_shr <- setNames(IFNg_data_updated$log2FoldChange, IFNg_data_updated$hgnc_name)
+IFNg_ranks_shr <- sort(IFNg_ranks_shr, decreasing = TRUE)
+IFNg_ranks_shr <- IFNg_ranks_shr[!duplicated(names(IFNg_ranks_shr))]
+
+#signed pval rank
+IFNg_data_updated$sign_pval <- -log10(IFNg_data_updated$pvalue) * sign(IFNg_data_updated$log2FoldChange)
+IFNg_ranks_sign_pval <- setNames(IFNg_data_updated$sign_pval, IFNg_data_updated$hgnc_name)
+IFNg_ranks_sign_pval <- sort(IFNg_ranks_sign_pval, decreasing = TRUE)
+IFNg_ranks_sign_pval <- IFNg_ranks_sign_pval[!duplicated(names(IFNg_ranks_sign_pval))]
+
+#some of them are infinite converting them to a high number
+high_val <- max(IFNg_ranks_sign_pval[is.finite(IFNg_ranks_sign_pval)], na.rm = TRUE) + 1
+IFNg_ranks_sign_pval[is.infinite(IFNg_ranks_sign_pval) & IFNg_ranks_sign_pval > 0] <- high_val
+
+```
+
+#prepare gsea input
+##for healthy vs RA analysis
+
+```{r}
+
+#we will filter the ones that doesnt have hgnc names (undefined transcripts) and the ones that dont have lfc 
+
+df_updated <- df %>%
+  filter(!is.na(hgnc_name), !is.na(log2FoldChange))
+
+unique_genes <- unique(df_updated$hgnc_name) 
+cat("dataframe after filtration number of genes:", nrow(df_updated), 
+    "\nNumber of unique hgnc symbols in the filtered dataframe:", length(unique_genes), "\n",
+    "The difference between them:", nrow(df_updated)- length(unique_genes))
+
+#now we will check if these genes with more than one entry is represented in our gene set
+duplicated_genes <- df_updated$hgnc_name[duplicated(df_updated$hgnc_name)]
+duplicated_genes <- unique(duplicated_genes)
+
+coverage_check <- lapply(Fib_gene_sets, function(genes) {
+  present <- genes %in% duplicated_genes
+  list(
+    present_genes = genes[present],
+    missing_genes = genes[!present],
+    n_present = sum(present),
+    n_missing = sum(!present)
+  )
+})
+sapply(coverage_check, function(x) c(present = x$n_present, missing = x$n_missing))
+#they are not covered in gene_set so we dont care about them
+
+#for GSEA we can use use both approaches -> signed p values or shrunken LFC (I have already shrunken them before doing deseq2 deg analysis)
+
+#the lfc rank
+ranks_shr <- setNames(df_updated$log2FoldChange, df_updated$hgnc_name)
+ranks_shr <- sort(ranks_shr, decreasing = TRUE)
+ranks_shr <- ranks_shr[!duplicated(names(ranks_shr))]
+
+#signed pval rank
+df_updated$sign_pval <- -log10(df_updated$pvalue) * sign(df_updated$log2FoldChange)
+ranks_sign_pval <- setNames(df_updated$sign_pval, df_updated$hgnc_name)
+ranks_sign_pval <- sort(ranks_sign_pval, decreasing = TRUE)
+ranks_sign_pval <- ranks_sign_pval[!duplicated(names(ranks_sign_pval))]
+
+#some of them are infinite converting them to a high number
+high_val <- max(ranks_sign_pval[is.finite(ranks_sign_pval)], na.rm = TRUE) + 1
+ranks_sign_pval[is.infinite(ranks_sign_pval) & ranks_sign_pval > 0] <- high_val
+
+```
+
+run gsea with both ranking systems
+
+```{r}
+
+fgsea_ifng_lfc <- fgsea(
+  pathways = Fib_gene_sets,
+  stats    = IFNg_ranks_shr,
+)
+
+fgsea_ifng_pval <- fgsea(
+  pathways = Fib_gene_sets,
+  stats    = IFNg_ranks_sign_pval,
+)
+
+plot_fgsea <- function(fgsea_result, name_of_the_stimulation,if_lfc) {
+  if (if_lfc == TRUE){
+    title = paste0("GSEA Pathways of ",name_of_the_stimulation," (log2foldchange)") 
+  }else{
+    title = paste0("GSEA Pathways of ",name_of_the_stimulation," (signed pvalue)") 
+  }
+  # Create the plot
+  p <- ggplot(fgsea_result, aes(x = reorder(pathway, -NES), y = NES, fill = padj)) +
+    geom_bar(stat = "identity", alpha = 0.9, width = 0.7) +
+    geom_text(aes(label = round(padj, 2)), hjust = 1.1, size = 5, color = "white")+ 
+    scale_fill_gradient(low = "#4575b4", high = "#d73027", limits = c(0, max(fgsea_result$padj))) +
+    coord_flip() +
+    labs(title = title,
+         x = "Pathway",
+         y = "Normalized Enrichment Score (NES)",
+         fill = "padj") +
+    theme_publish(base_size = 14) +
+    theme(plot.title = element_text(size = 16, face = "bold"),
+          legend.position = "bottom", legend.text = element_text(angle = 45))
+
+  return(p)
+}
+
+plot_fgsea_lfc <- plot_fgsea(fgsea_ifng_lfc,"IFNg",TRUE)
+plot_fgsea_lfc
+
+plot_fgsea_pval <- plot_fgsea(fgsea_ifng_pval,"IFNg",FALSE)
+plot_fgsea_pval
+
+
+ggsave(
+  plot = plot_fgsea_pval,
+  filename = "FGSEA_ifng_plot_pval.png",
+  bg = "transparent",
+  width = 9, height = 6
+)
+
+```
+
+run gsea with both ranking systems
+##for healthy vs RA analysis
+
+```{r}
+
+fgsea_ifng_lfc <- fgsea(
+  pathways = Fib_gene_sets,
+  stats    = ranks_shr,
+)
+
+fgsea_ifng_pval <- fgsea(
+  pathways = Fib_gene_sets,
+  stats    = ranks_sign_pval,
+)
+
+plot_fgsea <- function(fgsea_result, name_of_the_stimulation, if_lfc) {
+  
+  # Create label column for display
+  fgsea_result$label <- ifelse(
+    fgsea_result$padj < 0.001, 
+    "< 0.01", 
+    round(fgsea_result$padj, 2)
+  )
+  
+  # Set title
+  if (if_lfc) {
+    title <- paste0("GSEA Pathways of ", name_of_the_stimulation, " (log2foldchange)") 
+  } else {
+    title <- paste0("GSEA Pathways of ", name_of_the_stimulation, " (signed pvalue)") 
+  }
+  
+  # Plot
+  p <- ggplot(fgsea_result, aes(x = reorder(pathway, -NES), y = NES, fill = padj)) +
+    geom_bar(stat = "identity", alpha = 0.9, width = 0.7) +
+    geom_text(
+      aes(
+        label = label,
+        hjust = ifelse(NES >= 0, 1.1, -0.1)
+      ),
+      size = 5,
+      color = "white"
+    ) +
+    scale_fill_gradient(
+      low = "#4575b4", 
+      high = "#d73027", 
+      limits = c(0, max(fgsea_result$padj))
+    ) +
+    coord_flip() +
+    labs(
+      title = title,
+      x = "Pathway",
+      y = "Normalized Enrichment Score (NES)",
+      fill = "padj"
+    ) +
+    theme_publish(base_size = 16) +
+    theme(
+      plot.title = element_text(size = 16, face = "bold"),
+      legend.position = "bottom",
+      legend.text = element_text(angle = 45)
+    )
+  
+  return(p)
+}
+
+plot_fgsea_lfc <- plot_fgsea(fgsea_ifng_lfc, "Healthy vs RA", TRUE)
+plot_fgsea_lfc
+
+plot_fgsea_pval <- plot_fgsea(fgsea_ifng_pval, "Healthy vs RA", FALSE)
+plot_fgsea_pval
+
+
+ggsave(
+  plot = plot_fgsea_pval,
+  filename = "FGSEA_ifng_plot_pval.png",
+  bg = "transparent",
+  width = 9, height = 6
+)
+
+```
+
+Now do it for all cytokines !
+
+```{r}
+
+#challenge for you mim :) 
+
+```
+#Loop for all cytokines
+
+```{r}
+run_gsea_for_cytokine <- function(cytokine_name, cytokine_data, Fib_gene_sets, output_dir = "fgsea_outputs_new") {
+  
+  message("Processing cytokine: ", cytokine_name)
+  
+  data <- cytokine_data[[cytokine_name]]
+  
+  # Convert to HGNC symbols
+  data$hgnc_name <- checkGeneSymbols(data$genename)$Suggested.Symbol
+  
+  # Filter out invalid entries
+  valid_genes <- !is.na(data$hgnc_name) & !is.na(data$log2FoldChange)
+  data <- data[valid_genes, ]
+
+  # Remove duplicates
+  data <- data[!duplicated(data$hgnc_name), ]
+
+  # Create ranking vectors
+  lfc_ranks <- setNames(data$log2FoldChange, data$hgnc_name)
+  lfc_ranks <- sort(lfc_ranks, decreasing = TRUE)
+
+  data$sign_pval <- -log10(data$pvalue) * sign(data$log2FoldChange)
+  sign_pval_ranks <- setNames(data$sign_pval, data$hgnc_name)
+  sign_pval_ranks <- sort(sign_pval_ranks, decreasing = TRUE)
+
+  # Replace Inf values with large finite numbers
+  high_val <- max(sign_pval_ranks[is.finite(sign_pval_ranks)], na.rm = TRUE) + 1
+  sign_pval_ranks[is.infinite(sign_pval_ranks) & sign_pval_ranks > 0] <- high_val
+  sign_pval_ranks <- sign_pval_ranks[!is.na(sign_pval_ranks)]
+
+  # Run fgsea
+  fgsea_lfc <- fgsea(pathways = Fib_gene_sets, stats = lfc_ranks)
+  fgsea_pval <- fgsea(pathways = Fib_gene_sets, stats = sign_pval_ranks)
+
+  # Plotting function
+  plot_fgsea <- function(fgsea_result, title) {
+    fgsea_result$hjust <- ifelse(fgsea_result$NES >= 0, 1.1, -0.1)
+    fgsea_result$label <- ifelse(fgsea_result$padj < 0.001, "< 0.01", round(fgsea_result$padj, 2))
+
+    ggplot(fgsea_result, aes(x = reorder(pathway, -NES), y = NES, fill = padj)) +
+      geom_bar(stat = "identity", alpha = 0.9, width = 0.7) +
+      geom_text(aes(label = label, hjust = hjust), size = 5, color = "white") +
+      scale_fill_gradient(low = "#4575b4", high = "#d73027",
+                          limits = c(0, max(fgsea_result$padj, na.rm = TRUE))) +
+      coord_flip() +
+      labs(title = title, x = "Pathway", y = "Normalized Enrichment Score (NES)", fill = "padj") +
+      theme_publish(base_size = 14) +
+      theme(plot.title = element_text(size = 16, face = "bold"),
+            legend.position = "bottom", legend.text = element_text(angle = 45))
+  }
+  
+  # Create plots
+  p_lfc <- plot_fgsea(fgsea_lfc, paste("GSEA -", cytokine_name, "(LFC)"))
+  p_pval <- plot_fgsea(fgsea_pval, paste("GSEA -", cytokine_name, "(Signed p-value)"))
+
+  # Save results
+  dir.create(output_dir, showWarnings = FALSE)
+
+  ggsave(filename = file.path(output_dir, paste0("FGSEA_", cytokine_name, "_lfc.png")),
+         plot = p_lfc, width = 9, height = 6, bg = "transparent")
+  
+  ggsave(filename = file.path(output_dir, paste0("FGSEA_", cytokine_name, "_pval.png")),
+         plot = p_pval, width = 9, height = 6, bg = "transparent")
+  
+  # Return results if needed later
+  list(
+    fgsea_lfc = fgsea_lfc,
+    fgsea_pval = fgsea_pval,
+    plot_lfc = p_lfc,
+    plot_pval = p_pval,
+    ranking_vector = lfc_ranks
+  )
+}
+```
+#Run for all cytokines
+
+```{r}
+cytokine_names <- names(cytokine_data)  # should include: "all", "IFNa", "IFNg", etc.
+
+gsea_results_all <- lapply(cytokine_names, function(cytokine) {
+  run_gsea_for_cytokine(cytokine, cytokine_data, Fib_gene_sets)
+})
+
+names(gsea_results_all) <- cytokine_names
+#to look at a specific inflammation
+gsea_results_all$IL6
+
+```
+#classic GSEA plot for each pathway
+
+```{r}
+#recreating lfc_ranks_IFNg
+
+# Re-extract IFNg data
+data_IFNg <- cytokine_data[["IFNg"]]
+
+# Map gene names to HGNC
+data_IFNg$hgnc_name <- checkGeneSymbols(data_IFNg$genename)$Suggested.Symbol
+
+# Filter out invalid/NA entries
+valid_genes <- !is.na(data_IFNg$hgnc_name) & !is.na(data_IFNg$log2FoldChange)
+data_IFNg <- data_IFNg[valid_genes, ]
+
+# Remove duplicates
+data_IFNg <- data_IFNg[!duplicated(data_IFNg$hgnc_name), ]
+
+# Create ranked vector
+lfc_ranks_IFNg <- setNames(data_IFNg$log2FoldChange, data_IFNg$hgnc_name)
+lfc_ranks_IFNg <- sort(lfc_ranks_IFNg, decreasing = TRUE)
+
+##rerun your plotEnrichment() loop
+
+top_pathways <- gsea_results_all$IFNg$fgsea_lfc[order(gsea_results_all$IFNg$fgsea_lfc$padj), ]
+
+for (i in seq_len(min(5, nrow(top_pathways)))) {
+  pathway_name <- top_pathways$pathway[i]
+  
+  enrichment_plot <- plotEnrichment(
+    pathway = Fib_gene_sets[[pathway_name]],
+    stats = lfc_ranks_IFNg
+  ) +
+    ggtitle(paste("Enrichment for:", pathway_name))
+  
+  print(enrichment_plot)
+}
+
+```
