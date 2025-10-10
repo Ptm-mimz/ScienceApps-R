@@ -1,0 +1,1300 @@
+---
+title: "Metabolism"
+author: "Phatthamon"
+date: now
+format: html
+editor: source
+embed-resources: true
+---
+
+## Load Data
+
+```{r}
+library(cellpaintr)
+library(ggplot2)
+library(scater)
+library(scran)
+library(bluster)
+library(stringr)
+library(dplyr)
+library(batchelor)
+library(BiocParallel)
+library(tidyr)
+library(MultiAssayExperiment)
+library(lme4)
+library(lmerTest)
+library(ggrepel)
+n_threads <- 16
+
+```
+
+Path to files.
+
+```{r}
+  # path to files
+base <- paste0("/shares/rheumatologie.usz/mim/")
+
+# metabolism panel
+files_met <- c(
+  paste0(base, "250709 cytokines_metabolism/MyExpt_Cells-plate1.csv"), 
+  paste0(base, "250709 cytokines_metabolism/MyExpt_Cells-plate2.csv"), 
+  paste0(base, "250717 cytokines_metabolism lot2/MyExpt_Cells_plate1.csv"),
+  paste0(base, "250717 cytokines_metabolism lot2/MyExpt_Cells_plate2.csv")
+)
+sce <- Reduce(cbind, lapply(files_met, loadData))
+
+```
+## Data Transformation
+
+Prepare the data for machine learning.
+
+```{r}
+data_transformation <- function(sce) {
+
+  # per plate
+  plates <- unique(sce[["Plate"]])
+
+  plate_list <- lapply(plates, function(plate_id) {
+
+    # normalize per plate
+    sce_plate <- sce[, sce[["Plate"]] == plate_id]
+
+    # remove missing values in cells
+    mat <- assay(sce_plate, name = "features")
+    miss_cells <- apply(mat, 2, function(x) sum(is.na(x)))
+    cell_ids <- which(miss_cells > 0)
+    sce_plate <- sce_plate[, -cell_ids]
+    
+    # remove features with zero variance
+    sce_plate <- removeLowVariance(sce_plate)
+  
+    # remove outlier images
+    sce_plate <- removeOutliers(sce_plate, min = 10, max = 500)
+    
+    # transform non-negatives features and scale all features
+    sce_plate <- transformLogScale(sce_plate)
+    #sce_plate <- transformLogScale(sce_plate, robust = TRUE) #for robust z score (median)
+    
+    
+    # remove outlier cells
+    stats <- perCellQCMetrics(sce_plate, assay.type = "tfmfeatures")
+    #sce_plate <- sce_plate[, !isOutlier(stats$sum)]
+    outlier_cells <- isOutlier(stats$sum)
+    outlier_cells[is.na(outlier_cells)] <- FALSE  # treat NA as not outlier
+    sce_plate <- sce_plate[, !outlier_cells]
+  
+    # fix factors
+    sce_plate$Treatment <- as.factor(sce_plate$Treatment)
+    sce_plate$Treatment <- relevel(sce_plate$Treatment, ref = "control")
+    sce_plate
+  
+  })
+
+  # combine plates
+  feature_name_list <- lapply(plate_list,
+                              function(sce_plate) rownames(sce_plate))
+  include_features <- Reduce(intersect, feature_name_list)
+  plate_list <- lapply(plate_list,
+                       function(sce_plate) sce_plate[include_features, ])
+  sce <- do.call(cbind, plate_list)
+  sce$Plate <- as.factor(sce$Plate)
+  sce
+  
+}
+sce <- data_transformation(sce)
+plotCellsPerImage(sce)
+
+```
+
+Pseudo-bulk over images.
+
+```{r}
+sce_aggr <- aggregateAcrossCells(
+  sce,
+  id = colData(sce)[, c("ImageNumber", "Well", "Patient", "Plate")], 
+  use.assay.type = "tfmfeatures", 
+  statistics = "mean"
+  )
+
+```
+#explore each markers in details (only Intensity data)
+
+````{r}
+
+feature_names <- rownames(sce)
+
+#see all intensity feature name
+intensity_features <- grep("Intensity", feature_names, value = TRUE)
+print(intensity_features)
+
+
+# Extract intensity features from the assay slot
+intensity_data <- as.data.frame(t(assay(sce, "tfmfeatures")))  # change back to "tfmfeatures" if work with logtransform in above step
+
+# Filter for columns that start with "Intensity"
+intensity_features <- grep("^Intensity", colnames(intensity_data), value = TRUE)
+#intensity_data <- intensity_data[, intensity_features, drop = FALSE] #if want all Intensity data
+
+intensity_data <- intensity_data[, c("Intensity_MeanIntensity_CorrMitosox", 
+                                    "Intensity_MeanIntensity_CorrLipid", 
+                                    "Intensity_MeanIntensity_CorrEdU", 
+                                    "Intensity_IntegratedIntensity_CorrMitosox",
+                                    "Intensity_IntegratedIntensity_CorrLipid",
+                                    "Intensity_IntegratedIntensity_CorrEdU" )]
+
+
+# Extract metadata from colData
+metadata <- as.data.frame(colData(sce)[, c("Patient", "Treatment", "Disease", "Joint", "Plate")])
+df <- cbind(metadata, intensity_data)  # Replace with correct column names
+
+df_long <- pivot_longer(
+  df,
+  cols = starts_with("Intensity"),
+  names_to = "Feature",
+  values_to = "Intensity"
+)
+
+# Calculate mean per patient per condition
+df_summary <- df_long %>%
+  group_by(Patient, Treatment, Disease, Plate, Feature) %>%
+  summarise(MeanIntensity = mean(Intensity, na.rm = TRUE), .groups = "drop")
+
+
+features <- unique(df_summary$Feature)
+
+# Loop over each feature
+for (f in features) {
+  df_plot <- df_summary %>% filter(Feature == f)
+  
+  p <- ggplot(df_plot, aes(x = Treatment, y = MeanIntensity, fill = Treatment)) +
+    stat_summary(fun = mean, geom = "bar", color = "black", alpha = 0.4, width = 0.6) +
+    stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.3, color = "black") +
+    geom_point(aes(shape = Plate, color = Treatment),
+               position = position_jitter(width = 0.1),
+               size = 3.5, stroke = 1, alpha = 0.9) +
+    facet_wrap(~ Disease, scales = "fixed") +
+    theme_bw(base_size = 14) +
+    labs(
+      title = paste("Z-scored log-transformed feature intensities per Treatment_", f),
+      y = "Z-scored log intensity", #Mean Intensity (a.u.)
+      x = "Treatment"
+    ) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      strip.background = element_rect(fill = "gray90", color = "gray60"),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "right"
+    )
+   print(p) 
+}
+
+```
+## plot differences from control
+
+````{r}
+
+# Combine both plates and compute difference from control per patient
+# (Assuming control treatment is named "Control" — change if needed)
+control_label <- "control"
+
+df_diff <- df_summary %>%
+  group_by(Patient, Disease, Feature) %>%
+  mutate(
+    ControlValue = mean(MeanIntensity[Treatment == control_label], na.rm = TRUE),
+    DiffFromControl = MeanIntensity - ControlValue
+  ) %>%
+  filter(Treatment != control_label) %>%
+  ungroup()
+
+
+
+# Loop through each feature
+features <- unique(df_diff$Feature)
+
+for (f in features) {
+  df_plot <- df_diff %>% filter(Feature == f)
+  
+  p <- ggplot(df_plot, aes(x = Treatment, y = DiffFromControl, fill = Treatment)) +
+    stat_summary(fun = mean, geom = "bar", color = "black", alpha = 0.4, width = 0.6) +
+    stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.3, color = "black") +
+    geom_point(aes(shape = Plate, color = Treatment),
+               position = position_jitter(width = 0.1),
+               size = 3.5, stroke = 1, alpha = 0.9) +
+    geom_text_repel(
+    aes(label = Patient, color = Treatment),
+    size = 3.5,
+    position = position_jitter(width = 0.15),
+    show.legend = FALSE
+  ) +
+    facet_wrap(~ Disease, scales = "fixed") +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+    theme_bw(base_size = 14) +
+    labs(
+      title = paste("Relative feature intensity compared to control -", f),
+      y = "Difference from control (z-scored intensity)",
+      x = "Treatment"
+    ) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      strip.background = element_rect(fill = "gray90", color = "gray60"),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "right"
+    )
+  
+  print(p)
+
+}
+
+
+````
+#compare by Disease
+
+````{r}
+# 1. Extract features + metadata
+intensity_data <- as.data.frame(t(assay(sce, "features")))
+
+# Select only the features you want
+selected_features <- c(
+                                    "Intensity_MeanIntensity_CorrMitosox", 
+                                    "Intensity_MeanIntensity_CorrLipid", 
+                                    "Intensity_MeanIntensity_CorrEdU", 
+                                    "Intensity_IntegratedIntensity_CorrMitosox",
+                                    "Intensity_IntegratedIntensity_CorrLipid",
+                                    "Intensity_IntegratedIntensity_CorrEdU"
+  )
+intensity_data <- intensity_data[, selected_features]
+
+metadata <- as.data.frame(colData(sce)[, c("Patient", "Treatment", "Disease", "Plate")])
+
+# Combine metadata and intensity data
+df <- cbind(metadata, intensity_data)
+
+# Filter only control samples
+df_control <- df %>% filter(Treatment == "control")
+
+# Loop through each selected feature
+for (feature in selected_features) {
+  
+  # Summarize mean per patient x disease x plate
+  df_summary <- df_control %>%
+    group_by(Patient, Disease, Plate) %>%
+    summarise(MeanIntensity = mean(.data[[feature]], na.rm = TRUE), .groups = "drop")
+  
+  # Plot
+  p <- ggplot(df_summary, aes(x = Disease, y = MeanIntensity, fill = Disease)) +
+    stat_summary(fun = mean, geom = "bar", alpha = 0.4, color = "black", width = 0.6) +
+    stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.3, color = "black") +
+    geom_point(aes(shape = Plate, color = Disease), 
+               position = position_jitter(width = 0.1),
+               size = 3.5) +
+    #facet_wrap(~ Plate) + 
+    theme_bw(base_size = 14) +
+    labs(
+      title = paste("Mean", feature, "per Disease (Control Samples)"),
+      y = "Mean Intensity (a.u.)",
+      x = "Disease"
+    ) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "right"
+    )
+  
+  # Print plot
+  print(p)
+
+}
+
+```
+#LipidTOX
+
+````{r}
+# Plot histogram for lipidtox
+# to select cut off
+intensity_data <- as.data.frame(t(assay(sce, "tfmfeatures")))  # or use the assay name you used earlier
+metadata <- as.data.frame(colData(sce)[, c("Plate", "Well", "Patient", "Treatment", "Disease")])
+
+# Combine
+df <- cbind(metadata, intensity_data)
+
+# 3. Compute 75th percentile per Plate
+percentiles <- df %>%
+  group_by(Plate) %>%
+  summarise(P75 = quantile(Intensity_IntegratedIntensity_CorrLipid, 0.75, na.rm = TRUE)) 
+
+print(percentiles)
+
+# 4. Plot histogram with vertical line per plate
+ggplot(df, aes(x = Intensity_IntegratedIntensity_CorrLipid)) +
+  geom_histogram(fill = "#2C7BB6", alpha = 0.5, bins = 40, color = "black") +
+  geom_vline(
+    data = percentiles,
+    aes(xintercept = P75),
+    color = "red", linetype = "dashed", size = 1
+  ) +
+  facet_wrap(~ Plate, scales = "free_y") +
+  theme_bw(base_size = 14) +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(hjust = 0.5)
+  ) +
+  labs(
+    title = "Distribution of Intensity (CorrLipid) per Plate",
+    x = "Intensity (CorrLipid)",
+    y = "Cell Count",
+    caption = "Red dashed line = 75th percentile"
+  )
+
+#plot positive cell >75th percentile
+
+# 3. Assign positivity per cell
+df <- df %>%
+  left_join(percentiles, by = "Plate") %>%
+  mutate(Positive = Intensity_IntegratedIntensity_CorrLipid > P75)
+
+# 4. Summarize percent positive per Patient x Treatment x Plate
+df_percent <- df %>%
+  group_by(Patient, Treatment, Plate, Disease) %>%
+  summarise(PercentPositive = mean(Positive) * 100, .groups = "drop")
+
+# 5. Plot percent positive cells, combine both plates
+ggplot(df_percent, aes(x = Treatment, y = PercentPositive, fill = Treatment)) +
+  stat_summary(fun = mean, geom = "bar", alpha = 0.4, color = "black", width = 0.6) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.3, color = "black") +
+  geom_point(aes(shape = Plate, color = Treatment),
+             position = position_jitter(width = 0.15),
+             size = 3.5, alpha = 0.9) +
+  geom_text_repel(
+    aes(label = Patient, color = Treatment),
+    size = 3.5,
+    position = position_jitter(width = 0.15),
+    show.legend = FALSE
+  ) +
+  facet_wrap(~ Disease, scales = "fixed") +
+  theme_bw(base_size = 14) +
+  labs(
+    title = "Percent LipidTOX Positive Cells per Treatment (Cutoff = 75th percentile per Plate)",
+    y = "Percent Positive Cells (%)",
+    x = "Treatment"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    strip.background = element_rect(fill = "gray90", color = "gray60"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "right"
+  )
+
+```
+## Fit Single Model
+
+```{r}
+result <- fitModel(sce,
+                   target = "Disease", 
+                   interest_level = "RA", reference_level = "healthy", 
+                   group = "Patient", strata =  "Disease", 
+                   n_folds = 20, n_threads = 8)
+
+plotROC(result)
+
+
+```
+
+For Multiple model
+
+```{r}
+
+interest <- setdiff(unique(sce$Treatment), c("control"))
+result_list <- lapply(interest, function(level) {
+  fitModel(sce, 
+           target = "Treatment", 
+           interest_level = level, reference_level = "control", 
+           group = "Patient", strata = c("Disease"), 
+           n_folds = 10, n_threads = 8)
+})
+
+plotAUC(result_list)
+
+
+```
+Only selected features
+
+````{r}
+
+# overview of CellProfiler feature categories
+#   include: Texture, Intensity, AreaShape, 
+#   maybe include: RadialDistribution,  Neighbors, Location
+#   exclude because many corner cases: Granularity, Correlation
+
+sce_select <- sce[str_detect(names(sce), "Texture|Intensity|AreaShape"), ]
+
+interest <- setdiff(unique(sce_select$Treatment), c("control"))
+#sce_select <- sce_select[str_detect(names(sce_select), "CorrCyto"), ]
+
+result_list <- lapply(interest, function(level) {
+  fitModel(sce_select,
+                   target = "Treatment", 
+                   interest_level = level, reference_level = "control", 
+                   group = "Patient", strata =  "Disease", 
+                   n_folds = 10, n_threads = 8)
+  })
+
+plotAUC(result_list)
+
+
+```
+
+filter only Intensity data
+
+````{r}
+sce_select <- sce[str_detect(names(sce), "Texture|Intensity|AreaShape"), ]
+
+feature_names <- rownames(sce_select)
+
+#see all intensity feature name
+intensity_features <- grep("Intensity", feature_names, value = TRUE)
+print(intensity_features)
+
+
+# Extract intensity features from the assay slot
+intensity_data <- as.data.frame(t(assay(sce_select, "features")))  # change back to "tfmfeatures" if work with logtransform in above step
+
+# Filter for columns that start with "Intensity"
+intensity_features <- grep("^Intensity", colnames(intensity_data), value = TRUE)
+#intensity_data <- intensity_data[, intensity_features, drop = FALSE] #if want all Intensity data
+
+intensity_data <- intensity_data[, c("Intensity_MeanIntensity_CorrMitosox", 
+                                    "Intensity_MeanIntensity_CorrLipid", 
+                                    "Intensity_MeanIntensity_CorrEdU", 
+                                    "Intensity_IntegratedIntensity_CorrMitosox",
+                                    "Intensity_IntegratedIntensity_CorrLipid",
+                                    "Intensity_IntegratedIntensity_CorrEdU" )]
+
+
+# Extract metadata from colData
+metadata <- as.data.frame(colData(sce_select)[, c("Patient", "Treatment", "Disease")])  # Replace with correct column names
+
+# Combine metadata with intensity data
+df <- cbind(metadata, intensity_data)
+
+df_long <- pivot_longer(
+  df,
+  cols = starts_with("Intensity"),
+  names_to = "Feature",
+  values_to = "Intensity"
+)
+
+# Aggregate intensity values by Patient and Treatment
+df_aggregated <- df_long %>%
+  group_by(Patient, Treatment, Feature, Disease) %>%
+  summarize(Intensity = mean(Intensity, na.rm = TRUE)) %>%  # Use mean or median
+  ungroup()
+
+````
+
+#Handle with EdU plot
+
+````{r}
+# Plot histogram for Intensity_IntegratedIntensity_CorrEdU
+# to select cut off
+
+ggplot(
+    df_long[df_long$Feature == "Intensity_IntegratedIntensity_CorrEdU", ],
+    aes(x = Intensity)
+) +
+    geom_histogram(bins = 100, fill = "steelblue", color = "black") +
+    scale_x_continuous(
+        limits = c(0, quantile(df_long$Intensity[df_long$Feature == "Intensity_IntegratedIntensity_CorrEdU"], 0.99)),
+        expand = expansion(mult = c(0, 0.05))  # small padding on the right
+    ) +
+    labs(
+        title = "Histogram of Intensity_IntegratedIntensity_CorrEdU",
+        x = "Integrated Intensity",
+        y = "Cell Count"
+    ) +
+    theme_minimal()
+
+# Define the cutoff value
+cutoff <- 9
+
+df_corrEdU <- df_long %>%
+  filter(Feature == "Intensity_IntegratedIntensity_CorrEdU", !is.na(Intensity))
+
+# Create the histogram with adjusted axes
+ggplot(df_corrEdU, aes(x = Intensity)) +
+  geom_histogram(
+    binwidth = 0.2,   # reasonable based on your spread; adjust if needed
+    fill = "blue",
+    alpha = 0.7
+  ) +
+  geom_vline(
+    xintercept = cutoff,  # define this if you haven’t already
+    color = "red",
+    linetype = "dashed",
+    linewidth = 1
+  ) +
+  labs(
+    title = "Histogram of Intensity_IntegratedIntensity_CorrEdU",
+    x = "Intensity",
+    y = "Count"
+  ) +
+  facet_wrap(~ Disease + Treatment) +
+  scale_x_continuous(
+    limits = c(0, 20),  # shows main data bulk; remove or increase to show full range
+    breaks = seq(0, 20, 2)
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 14),
+    axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 12),
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 14),
+    plot.title = element_text(size = 16, face = "bold"),
+    strip.text = element_text(size = 14)
+  )
+
+
+#Calculate % of cells above cutoff
+
+df_summary <- df_corrEdU %>%
+  group_by(Disease, Treatment) %>%
+  summarise(
+    total_cells = n(),
+    above_cutoff = sum(Intensity > cutoff),
+    percent_above = (above_cutoff / total_cells) * 100
+  ) %>%
+  ungroup()
+
+# Print the result
+print(df_summary)
+
+#Plot — compare Treatments, facet by Disease
+
+ggplot(df_summary, aes(x = Treatment, y = percent_above, fill = Treatment)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(
+    title = paste("Percentage of Cells with Intensity >", cutoff),
+    y = "% Cells Above Cutoff",
+    x = "Treatment"
+  ) +
+  facet_wrap(~ Disease) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 14),
+    axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+    axis.title = element_text(size = 14),
+    plot.title = element_text(size = 16, face = "bold"),
+    strip.text = element_text(size = 14)
+  )
+
+#facet by both Disease and Treatment
+##Calculate per-patient percent above cutoff
+df_per_patient <- df_corrEdU %>%
+  group_by(Disease, Treatment, Patient) %>%
+  summarise(
+    total_cells = n(),
+    above_cutoff = sum(Intensity > cutoff),
+    percent_above = (above_cutoff / total_cells) * 100
+  ) %>%
+  ungroup()
+
+#Summarize for bars (mean per group)
+df_summary <- df_per_patient %>%
+  group_by(Disease, Treatment) %>%
+  summarise(
+    mean_percent = mean(percent_above, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+#Plot with bar + dot (each patient) and facet grid
+ggplot() +
+  # Bar: average percentage per disease-treatment group
+  geom_col(
+    data = df_summary,
+    aes(x = Disease, y = mean_percent, fill = Disease),
+    width = 0.6,
+    alpha = 0.8
+  ) +
+  # Dots: individual patient values
+  geom_jitter(
+    data = df_per_patient,
+    aes(x = Disease, y = percent_above),
+    width = 0.2,
+    size = 2,
+    shape = 21,
+    fill = "black",
+    color = "white"
+  ) +
+  facet_wrap(~ Treatment) +  # one panel per Treatment
+  labs(
+    title = paste("Percentage of Cells with Intensity >", cutoff),
+    x = "Disease",
+    y = "% Cells Above Cutoff"
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 14),
+    axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+    axis.title = element_text(size = 14),
+    plot.title = element_text(size = 16, face = "bold"),
+    strip.text = element_text(size = 14)
+  )
+
+
+````
+
+# Create the box plot
+
+````{r}
+# Create the plot with Healthy patients in blue
+ggplot(df_aggregated, aes(x = Treatment, y = Intensity, fill = Treatment)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.8) +  # Filled boxes with transparency
+  geom_jitter(aes(color = Disease), width = 0.2, alpha = 0.5, size = 2) +  # Map 'Disease' to color
+  scale_color_manual(values = c("Healthy" = "blue", "RA" = "red")) +  # Set colors for 'Disease'
+  facet_wrap(~Feature, scales = "free_y") +  # Facet by feature
+  labs(
+    title = "Comparison of Intensity Features Across Treatments",
+    subtitle = "Each dot represents one patient (RA is in red)",
+    x = "Treatment",
+    y = "Intensity",
+    fill = "Treatment",  # Legend for fill (boxplot)
+    color = "Disease"    # Legend for color (dots)
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    text = element_text(size = 14),  # Increase general text size
+    axis.text = element_text(size = 12),  # Increase axis text size
+    axis.title = element_text(size = 14),  # Increase axis title size
+    plot.title = element_text(size = 16, face = "bold"),  # Increase plot title size and make it bold
+    plot.subtitle = element_text(size = 14),  # Increase plot subtitle size
+    strip.text = element_text(size = 14)  # Increase facet label size
+  )
+
+````
+Plot patient box side-by-side
+
+````{r}
+# Create the plot with Healthy and RA patients side-by-side
+ggplot(df_long, aes(x = Treatment, y = Intensity, fill = Treatment)) +
+  geom_boxplot(aes(color = Disease), outlier.shape = NA, alpha = 0.8, position = position_dodge(width = 0.8)) +  # Boxplots with side-by-side grouping
+  geom_jitter(aes(color = Disease), alpha = 0.5, size = 2, position = position_dodge(width = 0.8)) +  # Jittered points with side-by-side grouping (no width argument)
+  scale_color_manual(values = c("Healthy" = "blue", "RA" = "red")) +  # Set colors for 'Disease'
+  scale_fill_manual(values = c("Treatment1" = "lightgray", "Treatment2" = "darkgray")) +  # Set fill colors for treatments
+  facet_wrap(~Feature, scales = "free_y") +  # Facet by feature
+  labs(
+    title = "Comparison of Intensity Features Across Treatments",
+    subtitle = "Each dot represents one patient (Healthy in blue, RA in red)",
+    x = "Treatment",
+    y = "Intensity",
+    fill = "Treatment",  # Legend for fill (boxplot)
+    color = "Disease"    # Legend for color (dots)
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    text = element_text(size = 14),  # Increase general text size
+    axis.text = element_text(size = 12),  # Increase axis text size
+    axis.title = element_text(size = 14),  # Increase axis title size
+    plot.title = element_text(size = 16, face = "bold"),  # Increase plot title size and make it bold
+    plot.subtitle = element_text(size = 14),  # Increase plot subtitle size
+    strip.text = element_text(size = 14)  # Increase facet label size
+  )
+
+````
+# Handle Lipidtox data
+
+````{r}
+# Plot histogram for Intensity_IntegratedIntensity_CorrLipid
+# to select cut off
+
+ggplot(
+    df_long[df_long$Feature == "Intensity_IntegratedIntensity_CorrLipid", ],
+    aes(x = Intensity)
+) +
+    geom_histogram(bins = 100, fill = "steelblue", color = "black") +
+    scale_x_continuous(
+        limits = c(0, quantile(df_long$Intensity[df_long$Feature == "Intensity_IntegratedIntensity_CorrLipid"], 0.99)),
+        expand = expansion(mult = c(0, 0.05))  # small padding on the right
+    ) +
+    labs(
+        title = "Histogram of Intensity_IntegratedIntensity_CorrLipid",
+        x = "Integrated Intensity",
+        y = "Cell Count"
+    ) +
+    theme_minimal()
+
+# Calculate the 75th percentile (Q3)
+q75 <- quantile(
+  df_long$Intensity[df_long$Feature == "Intensity_IntegratedIntensity_CorrLipid"],
+  probs = 0.75,
+  na.rm = TRUE
+)
+
+q75
+
+# Define the cutoff value => according from 75%
+cutoff <- 969
+
+
+df_corrLipid <- df_long %>%
+  filter(Feature == "Intensity_IntegratedIntensity_CorrLipid", !is.na(Intensity))
+
+# Create the histogram with adjusted axes
+ggplot(df_corrLipid, aes(x = Intensity)) +
+  geom_histogram(
+    binwidth = 20,   # reasonable based on your spread; adjust if needed
+    fill = "blue",
+    alpha = 0.7
+  ) +
+  geom_vline(
+    xintercept = cutoff,  # define this if you haven’t already
+    color = "red",
+    linetype = "dashed",
+    linewidth = 1
+  ) +
+  labs(
+    title = "Histogram of Intensity_IntegratedIntensity_CorrLipid",
+    x = "Intensity",
+    y = "Count"
+  ) +
+  facet_wrap(~ Disease + Treatment) +
+  scale_x_continuous(
+    limits = c(0, 3000),  # shows main data bulk; remove or increase to show full range
+    breaks = seq(0, 20, 2)
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 14),
+    axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 12),
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 14),
+    plot.title = element_text(size = 16, face = "bold"),
+    strip.text = element_text(size = 14)
+  )
+
+
+#Calculate % of cells above cutoff
+
+df_summary <- df_corrLipid %>%
+  group_by(Disease, Treatment) %>%
+  summarise(
+    total_cells = n(),
+    above_cutoff = sum(Intensity > cutoff),
+    percent_above = (above_cutoff / total_cells) * 100
+  ) %>%
+  ungroup()
+
+# Print the result
+print(df_summary)
+
+#Plot — compare Treatments, facet by Disease
+
+ggplot(df_summary, aes(x = Treatment, y = percent_above, fill = Treatment)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(
+    title = paste("Percentage of Cells with Intensity >", cutoff),
+    y = "% Cells Above Cutoff",
+    x = "Treatment"
+  ) +
+  facet_wrap(~ Disease) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 14),
+    axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+    axis.title = element_text(size = 14),
+    plot.title = element_text(size = 16, face = "bold"),
+    strip.text = element_text(size = 14)
+  )
+
+#facet by both Disease and Treatment
+##Calculate per-patient percent above cutoff
+df_per_patient <- df_corrLipid %>%
+  group_by(Disease, Treatment, Patient) %>%
+  summarise(
+    total_cells = n(),
+    above_cutoff = sum(Intensity > cutoff),
+    percent_above = (above_cutoff / total_cells) * 100
+  ) %>%
+  ungroup()
+
+#Summarize for bars (mean per group)
+df_summary <- df_per_patient %>%
+  group_by(Disease, Treatment) %>%
+  summarise(
+    mean_percent = mean(percent_above, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+#Plot with bar + dot (each patient) and facet grid
+ggplot() +
+  # Bar: average percentage per disease-treatment group
+  geom_col(
+    data = df_summary,
+    aes(x = Disease, y = mean_percent, fill = Disease),
+    width = 0.6,
+    alpha = 0.8
+  ) +
+  # Dots: individual patient values
+  geom_jitter(
+    data = df_per_patient,
+    aes(x = Disease, y = percent_above),
+    width = 0.2,
+    size = 2,
+    shape = 21,
+    fill = "black",
+    color = "white"
+  ) +
+  facet_wrap(~ Treatment) +  # one panel per Treatment
+  labs(
+    title = paste("Percentage of Cells with Intensity >", cutoff),
+    x = "Disease",
+    y = "% Cells Above Cutoff"
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 14),
+    axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+    axis.title = element_text(size = 14),
+    plot.title = element_text(size = 16, face = "bold"),
+    strip.text = element_text(size = 14)
+  )
+
+````
+# Handle MitoSOX data
+
+````{r}
+# Plot histogram for Intensity_MeanIntensity_CorrMitosox
+#or Intensity_IntegratedIntensity_CorrMitosox
+# to select cut off
+
+df_filtered <- df_long %>%
+  filter(Feature == "Intensity_MeanIntensity_CorrMitosox")
+
+#Summarize to get mean intensity per patient
+df_per_patient <- df_filtered %>%
+  group_by(Patient, Disease, Treatment) %>%
+  summarise(mean_intensity = mean(Intensity, na.rm = TRUE), .groups = "drop")
+
+
+#Create summary data for bar plot (mean per group)
+df_summary <- df_per_patient %>%
+  group_by(Disease, Treatment) %>%
+  summarise(mean_intensity = mean(mean_intensity, na.rm = TRUE), .groups = "drop")
+
+# 4. Plot
+ggplot() +
+  # Bars: mean across patients
+  geom_col(
+    data = df_summary,
+    aes(x = Disease, y = mean_intensity, fill = Disease),
+    width = 0.6,
+    alpha = 0.8
+  ) +
+  # One dot per patient
+  geom_jitter(
+    data = df_per_patient,
+    aes(x = Disease, y = mean_intensity),
+    width = 0.2,
+    size = 2,
+    shape = 21,
+    fill = "black",
+    color = "white"
+  ) +
+  facet_wrap(~ Treatment) +
+  labs(
+    title = "Mean CorrMitosox Intensity per Patient",  #change to Mean if use
+    x = "Disease",
+    y = "Mean Intensity per Patient"
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 14),
+    axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+    axis.title = element_text(size = 14),
+    plot.title = element_text(size = 16, face = "bold"),
+    strip.text = element_text(size = 14)
+  )
+
+````
+#Filter one function at a time
+
+```{r}
+#Mitosox <- mitochondrial ROS
+#from only some features Texture|Intensity|AreaShape
+
+#input data again
+sce_select <- sce[str_detect(names(sce), "Texture|Intensity|AreaShape"), ]
+
+sce_select <- sce_select[
+  str_detect(rownames(sce_select), "CorrMitosox"),  # keep only those rows
+  ]  
+
+#check if only have selected channel
+rownames(sce_select)
+
+
+interest <- setdiff(unique(sce_select$Treatment), c("control"))
+sce_select$Treatment <- as.factor(sce_select$Treatment)
+sce_select$Treatment <- droplevels(sce_select$Treatment)
+
+result_list <- lapply(interest, function(level) {
+   fitModel(sce_select,
+            target = "Treatment",
+            interest_level = level, reference_level = "control",
+            group = "Patient", strata = c("Disease"),
+            n_folds = 10, n_threads = 8)
+ })
+
+plotAUC(result_list)
+
+#customise plot
+aucs <- dplyr::bind_rows(lapply(result_list, function(result) {
+    level <- stringr::str_remove(names(result)[3], ".pred_")
+    mutate(yardstick::roc_auc(group_by(result, fold), names(result)[1], 
+                              names(result)[3]), predict = level)
+}))
+
+#Define treatment order and colors
+treatment_order <- aucs %>%
+  group_by(predict) %>%
+  summarise(median_auc = median(.estimate)) %>%
+  arrange(desc(median_auc)) %>%
+  pull(predict)
+
+color_palette <- c("IL1" = "#E69F00",  # Orange for IL1
+                   "PIC" = "#D55E00",  # Blue for others
+                   "LPS" = "#009E73",
+                   "IFN" = "#F0E442",
+                   "TNF" = "#0072B2")
+
+ggplot(aucs %>%
+         mutate(predict = factor(predict, levels = treatment_order)),
+       aes(x = predict, y = .estimate)) +
+  geom_boxplot(aes(fill = predict), alpha = 0.8, outlier.shape = NA) +
+  geom_jitter(width = 0.1, aes(color = predict), size = 2.5, alpha = 0.7) +
+  scale_fill_manual(values = color_palette) +
+  scale_color_manual(values = color_palette) +
+  theme_bw() +
+  theme(
+    panel.background = element_rect(fill = "white"),
+    plot.background = element_rect(fill = "white"),
+    panel.grid.major = element_line(color = "grey90"),
+    panel.grid.minor = element_blank(),
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 14, face = "bold"),
+    axis.title.x = element_blank()
+  ) +
+  labs(
+    y = "AUC",
+    title = "Area under the AUC curves for Mitochondrial ROS pathway (MitoSOX)"
+  ) +
+  scale_y_continuous(limits = c(0.5, 1.0), breaks = seq(0.5, 1.0, by = 0.1))
+
+
+
+```
+
+Lipid TOX 
+
+```{r}
+#LipidTOX <- Neural lipid
+#from only some features Texture|Intensity|AreaShape
+
+#input data again
+sce_select <- sce[str_detect(names(sce), "Texture|Intensity|AreaShape"), ]
+
+sce_select <- sce_select[
+  str_detect(rownames(sce_select), "CorrLipid"),  # keep only those rows
+  ]  
+
+#check if only have selected channel
+rownames(sce_select)
+
+
+interest <- setdiff(unique(sce_select$Treatment), c("control"))
+sce_select$Treatment <- as.factor(sce_select$Treatment)
+sce_select$Treatment <- droplevels(sce_select$Treatment)
+
+result_list <- lapply(interest, function(level) {
+   fitModel(sce_select,
+            target = "Treatment",
+            interest_level = level, reference_level = "control",
+            group = "Patient", strata = c("Disease"),
+            n_folds = 10, n_threads = 8)
+ })
+
+plotAUC(result_list)
+
+#customise plot
+aucs <- dplyr::bind_rows(lapply(result_list, function(result) {
+    level <- stringr::str_remove(names(result)[3], ".pred_")
+    mutate(yardstick::roc_auc(group_by(result, fold), names(result)[1], 
+                              names(result)[3]), predict = level)
+}))
+
+#Define treatment order and colors
+treatment_order <- aucs %>%
+  group_by(predict) %>%
+  summarise(median_auc = median(.estimate)) %>%
+  arrange(desc(median_auc)) %>%
+  pull(predict)
+
+color_palette <- c("IL1" = "#E69F00",  # Orange for IL1
+                   "PIC" = "#D55E00",  # Blue for others
+                   "LPS" = "#009E73",
+                   "IFN" = "#F0E442",
+                   "TNF" = "#0072B2")
+
+ggplot(aucs %>%
+         mutate(predict = factor(predict, levels = treatment_order)),
+       aes(x = predict, y = .estimate)) +
+  geom_boxplot(aes(fill = predict), alpha = 0.8, outlier.shape = NA) +
+  geom_jitter(width = 0.1, aes(color = predict), size = 2.5, alpha = 0.7) +
+  scale_fill_manual(values = color_palette) +
+  scale_color_manual(values = color_palette) +
+  theme_bw() +
+  theme(
+    panel.background = element_rect(fill = "white"),
+    plot.background = element_rect(fill = "white"),
+    panel.grid.major = element_line(color = "grey90"),
+    panel.grid.minor = element_blank(),
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 14, face = "bold"),
+    axis.title.x = element_blank()
+  ) +
+  labs(
+    y = "AUC",
+    title = "Area under the AUC curves for Neutral lipid pathway (LipidTOX)"
+  ) +
+  scale_y_continuous(limits = c(0.5, 1.0), breaks = seq(0.5, 1.0, by = 0.1))
+
+```
+
+EdU
+
+```{r}
+#EdU <- proliferation
+#from only some features Texture|Intensity|AreaShape
+
+#input data again
+sce_select <- sce[str_detect(names(sce), "Texture|Intensity|AreaShape"), ]
+
+sce_select <- sce_select[
+  str_detect(rownames(sce_select), "CorrEdU"),  # keep only those rows
+  ]  
+
+#check if only have selected channel
+rownames(sce_select)
+
+
+interest <- setdiff(unique(sce_select$Treatment), c("control"))
+sce_select$Treatment <- as.factor(sce_select$Treatment)
+sce_select$Treatment <- droplevels(sce_select$Treatment)
+
+result_list <- lapply(interest, function(level) {
+   fitModel(sce_select,
+            target = "Treatment",
+            interest_level = level, reference_level = "control",
+            group = "Patient", strata = c("Disease"),
+            n_folds = 10, n_threads = 8)
+ })
+
+plotAUC(result_list)
+
+#customise plot
+aucs <- dplyr::bind_rows(lapply(result_list, function(result) {
+    level <- stringr::str_remove(names(result)[3], ".pred_")
+    mutate(yardstick::roc_auc(group_by(result, fold), names(result)[1], 
+                              names(result)[3]), predict = level)
+}))
+
+#Define treatment order and colors
+treatment_order <- aucs %>%
+  group_by(predict) %>%
+  summarise(median_auc = median(.estimate)) %>%
+  arrange(desc(median_auc)) %>%
+  pull(predict)
+
+color_palette <- c("IL1" = "#E69F00",  # Orange for IL1
+                   "PIC" = "#D55E00",  # Blue for others
+                   "LPS" = "#009E73",
+                   "IFN" = "#F0E442",
+                   "TNF" = "#0072B2")
+
+ggplot(aucs %>%
+         mutate(predict = factor(predict, levels = treatment_order)),
+       aes(x = predict, y = .estimate)) +
+  geom_boxplot(aes(fill = predict), alpha = 0.8, outlier.shape = NA) +
+  geom_jitter(width = 0.1, aes(color = predict), size = 2.5, alpha = 0.7) +
+  scale_fill_manual(values = color_palette) +
+  scale_color_manual(values = color_palette) +
+  theme_bw() +
+  theme(
+    panel.background = element_rect(fill = "white"),
+    plot.background = element_rect(fill = "white"),
+    panel.grid.major = element_line(color = "grey90"),
+    panel.grid.minor = element_blank(),
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 14, face = "bold"),
+    axis.title.x = element_blank()
+  ) +
+  labs(
+    y = "AUC",
+    title = "Area under the AUC curves for Neutral lipid pathway (LipidTOX)"
+  ) +
+  scale_y_continuous(limits = c(0.5, 1.0), breaks = seq(0.5, 1.0, by = 0.1))
+
+````
+#compare healthy, RA, OA
+
+````{r}
+#all features
+
+sce_cont <- sce[, sce$Treatment == "control"]
+ 
+result <- fitModel(sce_cont,
+                   target = "Disease", 
+                   interest_level = "RA", reference_level = "OA", 
+                   group = "Patient", strata = "Disease",
+                   n_folds = 20, n_threads = 8)
+
+
+plotROC(result)
+
+#for selected features
+
+sce_select <- sce[str_detect(names(sce), "Texture|Intensity|AreaShape"), ]
+sce_cont <- sce_select[, sce_select$Treatment == "control"]
+
+result <- fitModel(sce_cont,
+                   target = "Disease", 
+                   interest_level = "OA", reference_level = "Healthy", 
+                   group = "Patient", strata = "Disease",
+                   n_folds = 20, n_threads = 8)
+
+
+plotROC(result)
+
+##only one function at a time
+
+sce_select <- sce[str_detect(names(sce), "Texture|Intensity|AreaShape"), ]
+
+sce_select <- sce_select[
+  str_detect(rownames(sce_select), "CorrEdU"),  #CorrMitosox, CorrEdU,CorrLipid
+  ]  
+sce_cont <- sce_select[, sce_select$Treatment == "control"]
+
+rownames(sce_select)
+
+result <- fitModel(sce_cont,
+                   target = "Disease", 
+                   interest_level = "OA", reference_level = "Healthy", 
+                   group = "Patient", strata = "Disease",
+                   n_folds = 10, n_threads = 8)
+
+
+plotROC(result)
+
+
+
+````
+#compare joint differences
+
+````{r}
+
+##only work for Joint that has in at least 2 diseases
+sce_cont <- sce[, sce$Treatment == "control"]
+ 
+#1
+result <- fitModel(sce_cont,
+                   target = "Joint", 
+                   interest_level = "wrist", reference_level = "mcp", 
+                   group = "Patient", strata = "Disease",
+                   n_folds = 5, n_threads = 8)  #only work with 5 folds-> low sample
+
+plotROC(result)
+
+### can't do per function analysis error; No event observations were detected in `truth` with event level 'mcp'.
+
+#2
+result <- fitModel(sce_cont,
+                   target = "Joint", 
+                   interest_level = "shoulder", reference_level = "knee", 
+                   group = "Patient", strata = "Disease",
+                   n_folds = 10, n_threads = 8)
+
+
+plotROC(result)
+
+##only one function at a time
+
+sce_select <- sce[str_detect(names(sce), "Texture|Intensity|AreaShape"), ]
+
+sce_select <- sce_select[
+  str_detect(rownames(sce_select), "CorrLipid"),  #CorrMitosox, CorrEdU,CorrLipid
+  ]  
+sce_cont <- sce_select[, sce_select$Treatment == "control"]
+
+rownames(sce_select)
+
+result <- fitModel(sce_cont,
+                   target = "Joint", 
+                   interest_level = "shoulder", reference_level = "knee", 
+                   group = "Patient", strata = "Disease",
+                   n_folds = 5, n_threads = 8)
+
+plotROC(result)
+
+#3
+result <- fitModel(sce_cont,
+                   target = "Joint", 
+                   interest_level = "wrist", reference_level = "knee", 
+                   group = "Patient", strata = "Disease",
+                   n_folds = 5, n_threads = 8)
+
+
+plotROC(result)
+
+##only one function at a time
+
+sce_select <- sce[str_detect(names(sce), "Texture|Intensity|AreaShape"), ]
+
+sce_select <- sce_select[
+  str_detect(rownames(sce_select), "CorrEdU"),  #CorrMitosox, CorrEdU,CorrLipid
+  ]  
+sce_cont <- sce_select[, sce_select$Treatment == "control"]
+
+rownames(sce_select)
+
+result <- fitModel(sce_cont,
+                   target = "Joint", 
+                   interest_level = "wrist", reference_level = "knee", 
+                   group = "Patient", strata = "Disease",
+                   n_folds = 5, n_threads = 8)
+
+plotROC(result)
+
+
+```
+## Unsupervised Analysis PCA
+
+````{r}
+sce <- runPCA(sce, exprs_values = "tfmfeatures")
+plotReducedDim(sce, dimred = "PCA", colour_by = "Treatment")
+plotReducedDim(sce, dimred = "PCA", colour_by = "Plate")
+
+sce_select <- sce[str_detect(names(sce), "Intensity"), ]
+sce_select <- runPCA(sce_select, exprs_values = "tfmfeatures", ncomponents = 10)
+plotReducedDim(sce_select , dimred = "PCA", colour_by = "Treatment")
+plotReducedDim(sce_select , dimred = "PCA", colour_by = "Plate")
+
+```
+
+What is driving PC1?
+
+```{r}
+plotPCACor(sce_select, filter_by = 1, top = 20)
+```
+

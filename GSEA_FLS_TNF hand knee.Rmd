@@ -1,0 +1,186 @@
+```{r}
+library(dplyr)
+library(tibble)
+library(clusterProfiler)
+library(enrichplot)
+library(ggplot2)
+library(forcats)
+library(tidyverse)
+library(DESeq2)
+
+```
+
+# path to files
+# Prepare ranked gene list from dataset (TNF treated cells)
+
+```{r}
+
+setwd("/data/plapha/TNF DEG-hand_knee")
+data <- read.csv("DEG_RA_Hand_TNF_Basal.csv")
+data <- read.csv("DEG_RA_Knee_TNF_Basal.csv")
+
+ ranked_genes <- data %>%   
+   filter(!is.na(log2FoldChange), !is.na(symbol)) %>%
+   arrange(desc(log2FoldChange)) %>%
+   distinct(symbol, .keep_all = TRUE) %>%
+   dplyr::select(symbol, log2FoldChange) %>%
+   deframe()
+
+```
+#Load new gene sets --> only express in Fibroblast (cutoff 10 from expression file)
+
+```{r}
+Fib_gene_sets <- readRDS("fib_gene_sets_cut10.rds")
+
+```
+#check coverage
+
+
+```{r}
+
+deg_genes <- unique(data$symbol)
+coverage_check <- lapply(Fib_gene_sets, function(genes) {
+  present <- genes %in% deg_genes
+  list(
+    present_genes = genes[present],
+    missing_genes = genes[!present],
+    n_present = sum(present),
+    n_missing = sum(!present)
+  )
+})
+
+#we replace the the names with the hgnc codes from deg and check the coverage again
+data$hgnc_name <- checkGeneSymbols(data$symbol)$Suggested.Symbol
+deg_genes_updated <- unique(data$hgnc_name)
+coverage_check <- lapply(Fib_gene_sets, function(genes) {
+  present <- genes %in% deg_genes_updated
+  list(
+    present_genes = genes[present],
+    missing_genes = genes[!present],
+    n_present = sum(present),
+    n_missing = sum(!present)
+  )
+})
+sapply(coverage_check, function(x) c(present = x$n_present, missing = x$n_missing))
+
+````
+#prepare gsea input
+
+```{r}
+
+#we will filter the ones that doesnt have hgnc names (undefined transcripts) and the ones that dont have lfc 
+
+data_updated <- data %>%
+  filter(!is.na(hgnc_name), !is.na(log2FoldChange))
+
+unique_genes <- unique(data_updated$hgnc_name) 
+cat("dataframe after filtration number of genes:", nrow(data_updated), 
+    "\nNumber of unique hgnc symbols in the filtered dataframe:", length(unique_genes), "\n",
+    "The difference between them:", nrow(data_updated)- length(unique_genes))
+
+#now we will check if these genes with more than one entry is represented in our gene set
+duplicated_genes <- data_updated$hgnc_name[duplicated(data_updated$hgnc_name)]
+duplicated_genes <- unique(duplicated_genes)
+
+coverage_check <- lapply(Fib_gene_sets, function(genes) {
+  present <- genes %in% duplicated_genes
+  list(
+    present_genes = genes[present],
+    missing_genes = genes[!present],
+    n_present = sum(present),
+    n_missing = sum(!present)
+  )
+})
+sapply(coverage_check, function(x) c(present = x$n_present, missing = x$n_missing))
+#they are not covered in gene_set so we dont care about them
+
+#for GSEA we can use use both approaches -> signed p values or shrunken LFC (I have already shrunken them before doing deseq2 deg analysis)
+
+#the lfc rank
+ranks_shr <- setNames(data_updated$log2FoldChange, data_updated$hgnc_name)
+ranks_shr <- sort(ranks_shr, decreasing = TRUE)
+ranks_shr <- ranks_shr[!duplicated(names(ranks_shr))]
+
+#signed pval rank
+data_updated$sign_pval <- -log10(data_updated$pvalue) * sign(data_updated$log2FoldChange)
+ranks_sign_pval <- setNames(data_updated$sign_pval, data_updated$hgnc_name)
+ranks_sign_pval <- sort(ranks_sign_pval, decreasing = TRUE)
+ranks_sign_pval <- ranks_sign_pval[!duplicated(names(ranks_sign_pval))]
+
+#some of them are infinite converting them to a high number
+high_val <- max(ranks_sign_pval[is.finite(ranks_sign_pval)], na.rm = TRUE) + 1
+ranks_sign_pval[is.infinite(ranks_sign_pval) & ranks_sign_pval > 0] <- high_val
+
+```
+#run gsea with both ranking systems
+
+```{r}
+fgsea_ifng_lfc <- fgsea(
+  pathways = Fib_gene_sets,
+  stats    = ranks_shr,
+)
+
+fgsea_ifng_pval <- fgsea(
+  pathways = Fib_gene_sets,
+  stats    = ranks_sign_pval,
+)
+
+plot_fgsea <- function(fgsea_result, name_of_the_stimulation, if_lfc) {
+  
+  # Create label column for display
+  fgsea_result$label <- ifelse(
+    fgsea_result$padj < 0.001, 
+    "< 0.01", 
+    round(fgsea_result$padj, 2)
+  )
+  
+  # Set title
+  if (if_lfc) {
+    title <- paste0("GSEA Pathways of ", name_of_the_stimulation, " (log2foldchange)") 
+  } else {
+    title <- paste0("GSEA Pathways of ", name_of_the_stimulation, " (signed pvalue)") 
+  }
+  
+  # Plot
+  p <- ggplot(fgsea_result, aes(x = reorder(pathway, -NES), y = NES, fill = padj)) +
+    geom_bar(stat = "identity", alpha = 0.9, width = 0.7) +
+    geom_text(
+      aes(
+        label = label,
+        hjust = ifelse(NES >= 0, 1.1, -0.1)
+      ),
+      size = 5,
+      color = "white"
+    ) +
+    scale_fill_gradient(
+      low = "#4575b4", 
+      high = "#d73027", 
+      limits = c(0, max(fgsea_result$padj))
+    ) +
+    coord_flip() +
+    labs(
+      title = title,
+      x = "Pathway",
+      y = "Normalized Enrichment Score (NES)",
+      fill = "padj"
+    ) +
+    theme_publish(base_size = 16) +
+    theme(
+      plot.title = element_text(size = 16, face = "bold"),
+      legend.position = "bottom",
+      legend.text = element_text(angle = 45)
+    )
+  
+  return(p)
+}
+
+plot_fgsea_lfc <- plot_fgsea(fgsea_ifng_lfc, "TNF Stimulate vs Unstimulate : Hand", TRUE)
+plot_fgsea_lfc
+
+plot_fgsea_pval <- plot_fgsea(fgsea_ifng_pval, "TNF Stimulate vs Unstimulate : Hand", FALSE)
+plot_fgsea_pval
+
+```
+
+
+

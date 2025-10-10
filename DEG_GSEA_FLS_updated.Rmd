@@ -351,11 +351,28 @@ ggsave(
 
 ```
 
-Now do it for all cytokines !
+# Extract gene list + padj from GSEA
+##for healthy vs RA analysis
 
 ```{r}
 
-#challenge for you mim :) 
+#extract from log2foldchange plot
+
+gene_list_autophagy_lipid <- fgsea_ifng_lfc %>%
+  as_tibble() %>%
+  filter(pathway %in% c("Autophagy", "Lipid Metabolism")) %>%
+  dplyr::select(pathway, padj, pval, leadingEdge) %>%
+  unnest(cols = leadingEdge) %>%
+  rename(gene = leadingEdge)
+
+# Merge with your original DE results
+gene_list_with_lfc <- gene_list_autophagy_lipid %>%
+  left_join(df %>% dplyr::select(hgnc_name, log2FoldChange, pvalue),
+            by = c("gene" = "hgnc_name"))
+
+gene_list_with_lfc
+
+write.csv(gene_list_with_lfc, "gene_list_with_lfc.csv", row.names = FALSE)
 
 ```
 #Loop for all cytokines
