@@ -23,6 +23,7 @@ library(tidyr)
 library(MultiAssayExperiment)
 library(lme4)
 library(lmerTest)
+library(ggrepel)
 n_threads <- 16
 
 ```
@@ -37,14 +38,26 @@ base <- paste0("/shares/rheumatologie.usz/mim/")
 # stress panel
 files_stress <- c(
   paste0(base, "250709 cytokines_stress/MyExpt_Cells.csv"), 
+  paste0(base, "250717 cytokines_stress lot2/MyExpt_Cells.csv")
+  )
+sce <- Reduce(cbind, lapply(files_stress, loadData))
+
+
+```
+
+merge with previous exp.
+
+```{r}
+
+# path to files
+base <- paste0("/shares/rheumatologie.usz/mim/")
+
+# stress panel
+files_stress <- c(
+  paste0(base, "250709 cytokines_stress/MyExpt_Cells.csv"), 
   paste0(base, "250717 cytokines_stress lot2/MyExpt_Cells.csv"),
   paste0(base, "250320 stress panel_cytokine/MyExpt_Cells.csv")
   )
-#sce <- Reduce(cbind, lapply(files_stress, loadData))
-
-#select one plate at a time
-#sce <- sce[, sce$Plate == "250709110001"]
-
 #in case some plate have different column name_plate from experiment 250320
 sce_list <- lapply(files_stress, loadData)
 
@@ -86,41 +99,64 @@ Prepare the data for machine learning.
 ```{r}
 data_transformation <- function(sce) {
 
-  # remove missing values in cells
-  mat <- assay(sce, name = "features")
-  miss_cells <- apply(mat, 2, function(x) sum(is.na(x)))
-  cell_ids <- which(miss_cells > 0)
-  sce <- sce[, -cell_ids]
+  # per plate
+  plates <- unique(sce[["Plate"]])
+
+  plate_list <- lapply(plates, function(plate_id) {
+
+    # normalize per plate
+    sce_plate <- sce[, sce[["Plate"]] == plate_id]
+
+    # remove cells with missing features
+    sce_plate <- removeNAs(sce_plate)
+    
+    # remove outlier images
+    sce_plate <- removeOutliers(sce_plate, min = 30, max = 300)
+    
+    # remove outlier cells
+    stats <- perCellQCMetrics(sce_plate, assay.type = "features")
+    sce_plate <- sce_plate[, !isOutlier(stats$sum)]
+    
+    # remove features with zero spread
+    sce_plate <- removeLowVariance(sce_plate, robust = FALSE)
+    
+    # transform non-negatives features and scale all features
+    sce_plate <- transformLogScale(sce_plate, robust = TRUE)
   
-  # remove features with zero variance
-  sce <- removeLowVariance(sce)
-
-  # remove outlier images
-  sce <- removeOutliers(sce, min = 10, max = 500)
+    # fix factors
+    sce_plate$Treatment <- as.factor(sce_plate$Treatment)
+    sce_plate$Treatment <- relevel(sce_plate$Treatment, ref = "control")
+    
+    sce_plate
   
-  # transform non-negatives features and scale all features
-  sce <- transformLogScale(sce)
+  })
 
-  # remove outlier cells
-  stats <- perCellQCMetrics(sce, assay.type = "tfmfeatures")
-  sce <- sce[, !isOutlier(stats$sum)]
-
-  # fix factors
-  sce$Treatment <- as.factor(sce$Treatment)
-  sce$Treatment <- relevel(sce$Treatment, ref = "cont")  #cont or control
+  # combine plates
+  feature_name_list <- lapply(plate_list,
+                              function(sce_plate) rownames(sce_plate))
+  include_features <- Reduce(intersect, feature_name_list)
+  plate_list <- lapply(plate_list,
+                       function(sce_plate) sce_plate[include_features, ])
+  sce <- do.call(cbind, plate_list)
   sce$Plate <- as.factor(sce$Plate)
   sce
   
 }
 sce <- data_transformation(sce)
-plotCellsPerImage(sce)
+
+lapply(unique(sce[["Plate"]]), function(plate_id) {
+  
+  plotCellsPerImage(sce[, sce[["Plate"]] == plate_id])
+  
+})
+
 
 #change treatment name -> these 2 plate have IFNg just like the ohter batch
-colData(sce)$Treatment[colData(sce)$Plate %in% c("140001", "150001") &
-                       colData(sce)$Treatment == "IFNa"] <- "IFN"
-
-colData(sce)$Disease[colData(sce)$Plate %in% c("140001", "150001") &
-                       colData(sce)$Disease == "healthy"] <- "Healthy"
+# colData(sce)$Treatment[colData(sce)$Plate %in% c("140001", "150001") &
+#                        colData(sce)$Treatment == "IFNa"] <- "IFN"
+# 
+# colData(sce)$Disease[colData(sce)$Plate %in% c("140001", "150001") &
+#                        colData(sce)$Disease == "healthy"] <- "Healthy"
 
 ```
 
@@ -143,7 +179,7 @@ Predict treatment.
 ```{r}
 # comparison
 reference_level <- "control"
-interest_levels <- setdiff(levels(sce_aggr$Treatment), reference_level)
+interest_levels <- setdiff(levels(sce$Treatment), reference_level)    #change to sce_agg if uses
 
 # same across panels
 types <- c("AreaShape", "Intensity", "Texture", "RadialDistribution", 
@@ -156,7 +192,7 @@ sce_list <- lapply(interest_levels, function(interest_level) {
   
   # compute y_hat
   predictLOO(
-    sce_aggr, 
+    sce, 
     interest_level = interest_level, reference_level = reference_level,
     types = types, channels = channels,
     n_threads = n_threads
@@ -553,7 +589,7 @@ df_long <- pivot_longer(
 
 # Calculate mean per patient per condition
 df_summary <- df_long %>%
-  group_by(Patient, Treatment, Disease, Plate, Feature) %>%
+  group_by(Patient, Treatment, Disease, Joint, Plate, Feature) %>%
   summarise(MeanIntensity = mean(Intensity, na.rm = TRUE), .groups = "drop")
 
 
@@ -569,10 +605,16 @@ for (f in features) {
     geom_point(aes(shape = Plate, color = Treatment),
                position = position_jitter(width = 0.1),
                size = 3.5, stroke = 1, alpha = 0.9) +
+    geom_text_repel(
+    aes(label = Joint, color = Treatment),
+    size = 3.5,
+    position = position_jitter(width = 0.15),
+    show.legend = FALSE
+    ) +
     facet_wrap(~ Disease, scales = "fixed") +
     theme_bw(base_size = 14) +
     labs(
-      title = paste("Z-scored log-transformed feature intensities per Treatment_", f),
+      title = paste("Robust Z-scored log-transformed feature intensities per Treatment_", f),
       y = "Z-scored log intensity", #Mean Intensity (a.u.)
       x = "Treatment"
     ) +
@@ -673,58 +715,6 @@ for (f in features) {
   print(p)
 
 }
-````
-#plot TMRM
-
-````{r}
-
-df_filtered <- df_long %>%
-  filter(Feature == "Intensity_IntegratedIntensity_CorrTMRM")  #Intensity_IntegratedIntensity_CorrTMRM , Intensity_MeanIntensity_CorrTMRM
-
-#Summarize to get mean intensity per patient
-df_per_patient <- df_filtered %>%
-  group_by(Patient, Disease, Treatment) %>%
-  summarise(mean_intensity = mean(Intensity, na.rm = TRUE), .groups = "drop")
-
-
-#Create summary data for bar plot (mean per group)
-df_summary <- df_per_patient %>%
-  group_by(Disease, Treatment) %>%
-  summarise(mean_intensity = mean(mean_intensity, na.rm = TRUE), .groups = "drop")
-
-# 4. Plot
-ggplot() +
-  # Bars: mean across patients
-  geom_col(
-    data = df_summary,
-    aes(x = Disease, y = mean_intensity, fill = Disease),
-    width = 0.6,
-    alpha = 0.8
-  ) +
-  # One dot per patient
-  geom_jitter(
-    data = df_per_patient,
-    aes(x = Disease, y = mean_intensity),
-    width = 0.2,
-    size = 2,
-    shape = 21,
-    fill = "black",
-    color = "white"
-  ) +
-  facet_wrap(~ Treatment) +
-  labs(
-    title = "Integrated CorrTMRM Intensity per Patient",  #change to Mean if use
-    x = "Disease",
-    y = "Integrated Intensity per Patient"
-  ) +
-  theme_minimal() +
-  theme(
-    text = element_text(size = 14),
-    axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
-    axis.title = element_text(size = 14),
-    plot.title = element_text(size = 16, face = "bold"),
-    strip.text = element_text(size = 14)
-  )
 
 ````
 #CytoID
@@ -741,12 +731,12 @@ df <- cbind(metadata, intensity_data)
 # 3. Compute 75th percentile per Plate
 percentiles <- df %>%
   group_by(Plate) %>%
-  summarise(P75 = quantile(Intensity_MeanIntensity_CorrCytoID, 0.75, na.rm = TRUE)) #or Intensity_IntegratedIntensity_CorrCytoID, Intensity_MeanIntensity_CorrCytoID
+  summarise(P75 = quantile(Intensity_IntegratedIntensity_CorrCytoID, 0.75, na.rm = TRUE)) #or Intensity_IntegratedIntensity_CorrCytoID, Intensity_MeanIntensity_CorrCytoID
 
 print(percentiles)
 
 # 4. Plot histogram with vertical line per plate
-ggplot(df, aes(x = Intensity_MeanIntensity_CorrCytoID)) +
+ggplot(df, aes(x = Intensity_IntegratedIntensity_CorrCytoID)) +
   geom_histogram(fill = "#2C7BB6", alpha = 0.5, bins = 40, color = "black") +
   geom_vline(
     data = percentiles,
@@ -785,6 +775,12 @@ ggplot(df_percent, aes(x = Treatment, y = PercentPositive, fill = Treatment)) +
   geom_point(aes(shape = Plate, color = Treatment),
              position = position_jitter(width = 0.15),
              size = 3.5, alpha = 0.9) +
+  geom_text_repel(
+    aes(label = Patient, color = Treatment),
+    size = 3.5,
+    position = position_jitter(width = 0.15),
+    show.legend = FALSE
+  ) +
   facet_wrap(~ Disease, scales = "fixed") +
   theme_bw(base_size = 14) +
   labs(
@@ -838,9 +834,15 @@ for (feature in selected_features) {
   p <- ggplot(df_summary, aes(x = Disease, y = MeanIntensity, fill = Disease)) +
     stat_summary(fun = mean, geom = "bar", alpha = 0.4, color = "black", width = 0.6) +
     stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.3, color = "black") +
-    geom_point(aes(shape = Plate, color = Disease), 
+    geom_point(aes(shape = Plate, color = Disease),
                position = position_jitter(width = 0.1),
                size = 3.5) +
+    geom_text_repel(
+      aes(label = Patient, color = Disease),
+      size = 3.5,
+      position = position_jitter(width = 0.1),
+      show.legend = FALSE
+    ) +
     #facet_wrap(~ Plate) + 
     theme_bw(base_size = 14) +
     labs(
@@ -856,10 +858,25 @@ for (feature in selected_features) {
   
   # Print plot
   print(p)
-
 }
 
 ````
-
+## Unsupervised Analysis PCA
 
 ````{r}
+sce <- runPCA(sce, exprs_values = "tfmfeatures")
+plotReducedDim(sce, dimred = "PCA", colour_by = "Treatment")
+plotReducedDim(sce, dimred = "PCA", colour_by = "Plate")
+
+sce_select <- sce[str_detect(names(sce), "Intensity"), ]
+sce_select <- runPCA(sce_select, exprs_values = "tfmfeatures", ncomponents = 10)
+plotReducedDim(sce_select , dimred = "PCA", colour_by = "Treatment")
+plotReducedDim(sce_select , dimred = "PCA", colour_by = "Plate")
+
+```
+
+What is driving PC1?
+
+```{r}
+plotPCACor(sce_select, filter_by = 1, top = 20)
+```
