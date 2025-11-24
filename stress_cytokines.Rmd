@@ -24,6 +24,9 @@ library(MultiAssayExperiment)
 library(lme4)
 library(lmerTest)
 library(ggrepel)
+library(ggpubr)
+library(viridis)
+library(rstatix)
 n_threads <- 16
 
 ```
@@ -91,7 +94,34 @@ sce_list <- lapply(files_stress, loadData)
 sce <- sce_list[[1]]
 
 ```
+Path to files.-> for experiment 250320
 
+```{r}
+# path to files
+base <- paste0("/shares/rheumatologie.usz/mim/")
+
+# stress panel
+files_stress <- c(
+  paste0(base, "250320 stress panel_cytokine/MyExpt_Cells.csv")
+  )
+sce <- Reduce(cbind, lapply(files_stress, loadData))
+
+# this experiment has 2 plates -> need to merge them
+# Select the two plates
+sce_140 <- sce[, sce$Plate == "140001"]
+sce_150 <- sce[, sce$Plate == "150001"]
+
+# Combine them (bind cells/columns)
+sce_merged <- cbind(sce_140, sce_150)
+
+# Rename the Plate column to the same value for all
+sce_merged$Plate <- factor("140001")
+
+# Check the result
+table(sce_merged$Patient, sce_merged$Plate)
+
+#now can go for transform step
+```
 ## Data Transformation
 
 Prepare the data for machine learning.
@@ -118,14 +148,17 @@ data_transformation <- function(sce) {
     sce_plate <- sce_plate[, !isOutlier(stats$sum)]
     
     # remove features with zero spread
-    sce_plate <- removeLowVariance(sce_plate, robust = FALSE)
+    sce_plate <- removeLowVariance(sce_plate, robust = TRUE)
+    
+    # remove zero-inflated features
+    sce_plate <- removeZeroInflation(sce_plate)
     
     # transform non-negatives features and scale all features
     sce_plate <- transformLogScale(sce_plate, robust = TRUE)
   
     # fix factors
     sce_plate$Treatment <- as.factor(sce_plate$Treatment)
-    sce_plate$Treatment <- relevel(sce_plate$Treatment, ref = "control")
+    sce_plate$Treatment <- relevel(sce_plate$Treatment, ref = "cont")
     
     sce_plate
   
@@ -392,164 +425,7 @@ ggsave("AUC_TMRM-selected features.png",
        plot = last_plot(),
        width = 8, height = 6, dpi = 300)
 ````
-#run each function with selected features
 
-```{r}
-
-#CorrCytoID <- autophagy
-#from only some features Texture|Intensity|AreaShape
-
-#input data again
-sce_select <- sce[str_detect(names(sce), "Texture|Intensity|AreaShape"), ]
-
-sce_select <- sce_select[
-  str_detect(rownames(sce_select), "CorrCytoID"),  #change between CorrTMRM, CorrCytoID, CorrLyso
-  ]  
-
-#check if only have selected channel
-rownames(sce_select)
-
-
-interest <- setdiff(unique(sce_select$Treatment), c("control"))
-sce_select$Treatment <- as.factor(sce_select$Treatment)
-sce_select$Treatment <- droplevels(sce_select$Treatment)
-
-result_list <- lapply(interest, function(level) {
-   fitModel(sce_select,
-            target = "Treatment",
-            interest_level = level, reference_level = "control",
-            group = "Patient", strata = c("Disease"),
-            n_folds = 10, n_threads = 8)
- })
-
-plotAUC(result_list)
-
-#customise plot
-aucs <- dplyr::bind_rows(lapply(result_list, function(result) {
-    level <- stringr::str_remove(names(result)[3], ".pred_")
-    mutate(yardstick::roc_auc(group_by(result, fold), names(result)[1], 
-                              names(result)[3]), predict = level)
-}))
-
-#Define treatment order and colors
-treatment_order <- aucs %>%
-  group_by(predict) %>%
-  summarise(median_auc = median(.estimate)) %>%
-  arrange(desc(median_auc)) %>%
-  pull(predict)
-
-color_palette <- c("IL1" = "#E69F00",  # Orange for IL1
-                   "PIC" = "#D55E00",  # Blue for others
-                   "LPS" = "#009E73",
-                   "IFN" = "#F0E442",
-                   "TNF" = "#0072B2")
-
-ggplot(aucs %>%
-         mutate(predict = factor(predict, levels = treatment_order)),
-       aes(x = predict, y = .estimate)) +
-  geom_boxplot(aes(fill = predict), alpha = 0.8, outlier.shape = NA) +
-  geom_jitter(width = 0.1, aes(color = predict), size = 2.5, alpha = 0.7) +
-  scale_fill_manual(values = color_palette) +
-  scale_color_manual(values = color_palette) +
-  theme_bw() +
-  theme(
-    panel.background = element_rect(fill = "white"),
-    plot.background = element_rect(fill = "white"),
-    panel.grid.major = element_line(color = "grey90"),
-    panel.grid.minor = element_blank(),
-    legend.position = "none",
-    axis.text.x = element_text(angle = 45, hjust = 1, size = 14, face = "bold"),
-    axis.title.x = element_blank()
-  ) +
-  labs(
-    y = "AUC",
-    title = "Area under the AUC curves for Autophagy (CytoID)"
-  ) +
-  scale_y_continuous(limits = c(0.5, 1.0), breaks = seq(0.5, 1.0, by = 0.1))
-
-ggsave("AUC_CytoID-selected features.png",
-       plot = last_plot(),
-       width = 8, height = 6, dpi = 300)
-
-
-
-#CorrLyso <- Lysosome
-#from only some features Texture|Intensity|AreaShape
-
-#input data again
-sce_select <- sce[str_detect(names(sce), "Texture|Intensity|AreaShape"), ]
-
-sce_select <- sce_select[
-  str_detect(rownames(sce_select), "CorrLyso"),  #change between CorrTMRM, CorrCytoID, CorrLyso
-  ]  
-
-#check if only have selected channel
-rownames(sce_select)
-
-
-interest <- setdiff(unique(sce_select$Treatment), c("control"))
-sce_select$Treatment <- as.factor(sce_select$Treatment)
-sce_select$Treatment <- droplevels(sce_select$Treatment)
-
-result_list <- lapply(interest, function(level) {
-   fitModel(sce_select,
-            target = "Treatment",
-            interest_level = level, reference_level = "control",
-            group = "Patient", strata = c("Disease"),
-            n_folds = 10, n_threads = 8)
- })
-
-plotAUC(result_list)
-
-#customise plot
-aucs <- dplyr::bind_rows(lapply(result_list, function(result) {
-    level <- stringr::str_remove(names(result)[3], ".pred_")
-    mutate(yardstick::roc_auc(group_by(result, fold), names(result)[1], 
-                              names(result)[3]), predict = level)
-}))
-
-#Define treatment order and colors
-treatment_order <- aucs %>%
-  group_by(predict) %>%
-  summarise(median_auc = median(.estimate)) %>%
-  arrange(desc(median_auc)) %>%
-  pull(predict)
-
-color_palette <- c("IL1" = "#E69F00",  # Orange for IL1
-                   "PIC" = "#D55E00",  # Blue for others
-                   "LPS" = "#009E73",
-                   "IFN" = "#F0E442",
-                   "TNF" = "#0072B2")
-
-ggplot(aucs %>%
-         mutate(predict = factor(predict, levels = treatment_order)),
-       aes(x = predict, y = .estimate)) +
-  geom_boxplot(aes(fill = predict), alpha = 0.8, outlier.shape = NA) +
-  geom_jitter(width = 0.1, aes(color = predict), size = 2.5, alpha = 0.7) +
-  scale_fill_manual(values = color_palette) +
-  scale_color_manual(values = color_palette) +
-  theme_bw() +
-  theme(
-    panel.background = element_rect(fill = "white"),
-    plot.background = element_rect(fill = "white"),
-    panel.grid.major = element_line(color = "grey90"),
-    panel.grid.minor = element_blank(),
-    legend.position = "none",
-    axis.text.x = element_text(angle = 45, hjust = 1, size = 14, face = "bold"),
-    axis.title.x = element_blank()
-  ) +
-  labs(
-    y = "AUC",
-    title = "Area under the AUC curves for Lysosome"
-  ) +
-  scale_y_continuous(limits = c(0.5, 1.0), breaks = seq(0.5, 1.0, by = 0.1))
-
-
-ggsave("AUC_Lysosome-selected features.png",
-       plot = last_plot(),
-       width = 8, height = 6, dpi = 300)
-
-````
 #explore each markers in details (only Intensity data)
 
 ````{r}
@@ -573,7 +449,8 @@ intensity_data <- intensity_data[, c("Intensity_MeanIntensity_CorrTMRM",
                                     "Intensity_MeanIntensity_CorrLyso", 
                                     "Intensity_IntegratedIntensity_CorrTMRM",
                                     "Intensity_IntegratedIntensity_CorrCytoID",
-                                    "Intensity_IntegratedIntensity_CorrLyso" )]
+                                    "Intensity_IntegratedIntensity_CorrLyso",
+                                    "Intensity_MeanIntensityEdge_CorrTMRM" )]
 
 
 # Extract metadata from colData
@@ -614,7 +491,7 @@ for (f in features) {
     facet_wrap(~ Disease, scales = "fixed") +
     theme_bw(base_size = 14) +
     labs(
-      title = paste("Robust Z-scored log-transformed feature intensities per Treatment_", f),
+      title = paste("Z-scored log-transformed feature intensities per Treatment_", f),
       y = "Z-scored log intensity", #Mean Intensity (a.u.)
       x = "Treatment"
     ) +
@@ -714,6 +591,92 @@ for (f in features) {
   
   print(p)
 
+}
+
+````
+# for develpoment panel -> single cell plot
+
+````{r}
+
+intensity_data <- as.data.frame(t(assay(sce, "tfmfeatures")))
+intensity_features <- c(
+  "Intensity_MeanIntensity_CorrTMRM", 
+  "Intensity_MeanIntensity_CorrCytoID", 
+  "Intensity_MeanIntensity_CorrLyso", 
+  "Intensity_IntegratedIntensity_CorrTMRM",
+  "Intensity_IntegratedIntensity_CorrCytoID",
+  "Intensity_IntegratedIntensity_CorrLyso",
+  "Intensity_MeanIntensity_CorrBlue"
+)
+intensity_data <- intensity_data[, intensity_features, drop = FALSE]
+
+metadata <- as.data.frame(colData(sce)[, c("Patient", "Treatment", "Disease", "Joint", "Plate")])
+df <- cbind(metadata, intensity_data)
+
+df <- df %>% filter(Disease == "healthy")
+
+df_long <- df %>%
+  pivot_longer(
+    cols = all_of(intensity_features),
+    names_to = "Feature",
+    values_to = "Intensity"
+  )
+
+ref_treatment <- "cont"
+treatment_colors <- RColorBrewer::brewer.pal(n = length(unique(df_long$Treatment)), name = "Set2")
+names(treatment_colors) <- unique(df_long$Treatment)
+
+# 7. Loop through all features and plot
+for (f in unique(df_long$Feature)) {
+  df_plot <- df_long %>% filter(Feature == f)
+
+  # Statistical test (Wilcoxon, Bonferroni)
+  stat.test <- ggpubr::compare_means(
+    Intensity ~ Treatment,
+    data = df_plot,
+    method = "wilcox.test",
+    ref.group = ref_treatment,
+    p.adjust.method = "bonferroni"
+  )
+
+  # Assign y positions for stars
+  stat.test <- stat.test %>%
+    mutate(
+      y.position = max(df_plot$Intensity, na.rm = TRUE) + 
+        (1:n()) * (0.05 * diff(range(df_plot$Intensity, na.rm = TRUE)))
+    )
+
+  # Plot
+  p <- ggplot(df_plot, aes(x = Treatment, y = Intensity, fill = Treatment)) +
+    geom_violin(trim = FALSE, alpha = 0.35, color = "gray40", width = 0.9) +
+    geom_boxplot(width = 0.15, outlier.shape = NA, alpha = 0.7, color = "black") +
+    geom_jitter(aes(color = Treatment), size = 1.2, width = 0.2, alpha = 0.4) +
+    scale_fill_manual(values = treatment_colors) +
+    scale_color_manual(values = treatment_colors) +
+    labs(
+      title = paste("Single-cell intensity (Healthy) —", f),
+      y = "Z-scored log intensity",
+      x = "Treatment",
+      color = "Treatment",
+      fill = "Treatment"
+    ) +
+    theme_bw(base_size = 18) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 20),
+      axis.title = element_text(size = 18, face = "bold"),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 16),
+      axis.text.y = element_text(size = 14),
+      legend.position = "right",
+      panel.grid = element_blank()
+    ) +
+    stat_pvalue_manual(
+      stat.test,
+      label = "p.signif",  # show stars instead of p values
+      size = 6,
+      tip.length = 0.01
+    )
+
+  print(p)
 }
 
 ````
@@ -880,3 +843,395 @@ What is driving PC1?
 ```{r}
 plotPCACor(sce_select, filter_by = 1, top = 20)
 ```
+
+# reduce redundancy in CellProfiler feature
+Try with Mitochondria
+
+```{r}
+
+mat <- assay(sce)
+corr_features <- mat[grep("CorrTMRM", rownames(mat)), , drop = FALSE]
+dim(corr_features)
+
+#Compute feature–feature correlation matrix
+# Transpose: we want correlation across features, not cells
+cor_mat <- cor(t(corr_features), method = "pearson", use = "pairwise.complete.obs")
+
+
+#Hierarchical clustering of correlated features
+# Hierarchical clustering
+hc <- hclust(as.dist(1 - cor_mat), method = "average")
+
+# Visualize
+plot(hc, labels = FALSE, main = "Hierarchical clustering of features")
+
+#Cut the dendrogram at a correlation height
+# Example: height = 0.3 (usually between 0.3-0.7)
+
+# Cut the dendrogram at correlation 0.8 → distance = 1 - 0.8 = 0.2
+clusters <- cutree(hc, h = 0.6)
+
+table(clusters)
+
+#Choose a representative feature per cluster
+# Compute variance per feature
+feat_var <- apply(corr_features, 1, var)
+
+# Select representative feature per cluster
+rep_features <- sapply(unique(clusters), function(cl){
+  feats <- names(clusters[clusters == cl])
+  feats[which.max(feat_var[feats])]
+})
+
+rep_features <- unname(rep_features)
+
+#Check for multicollinearity using VIF
+library(car)
+
+# Create data frame of selected features
+df_rep <- t(corr_features[rep_features, ])
+
+# Fit a simple model to compute VIF
+vif_model <- lm(df_rep[,1] ~ ., data = as.data.frame(df_rep))
+vif_values <- vif(vif_model)
+
+# Filter out any with VIF > 10
+low_vif_features <- names(vif_values[vif_values < 10])
+
+#subset into sce
+sce_reduced <- sce[rownames(sce) %in% rep_features, ]
+
+#Visualise clustered heatmap
+
+library(pheatmap)
+pheatmap(
+  cor_mat,
+  clustering_distance_rows = as.dist(1 - cor_mat),
+  clustering_distance_cols = as.dist(1 - cor_mat),
+  clustering_method = "average",
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  main = "Correlation heatmap of CorrTMRM features",
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  border_color = NA
+)
+
+
+# corr_features: features x cells
+# clusters: cluster assignment for each feature
+
+rep_features <- sapply(unique(clusters), function(cl){
+  
+  # Get features in this cluster
+  feats <- names(clusters[clusters == cl])
+  
+  # Subset matrix
+  sub_mat <- corr_features[feats, , drop = FALSE]
+  
+  # Compute median across features per cell
+  # Then find the feature closest to this median profile
+  cluster_median <- apply(sub_mat, 2, median)
+  
+  # Compute Euclidean distance of each feature to cluster median
+  dists <- apply(sub_mat, 1, function(x) sqrt(sum((x - cluster_median)^2)))
+  
+  # Select feature closest to median
+  feats[which.min(dists)]
+})
+
+# Unname if needed
+rep_features <- unname(rep_features)
+
+# Check how many representative features
+length(rep_features)
+rep_features
+
+#save file as csv table
+rep_features_df <- data.frame(
+  Feature = rep_features,
+  Cluster = unique(clusters)
+)
+
+write.csv(rep_features_df, file = "rep_features_with_clusters_TMRM cut 0.7.csv", row.names = FALSE, quote = FALSE)
+
+```
+#Feature importance analysis
+
+```{r}
+#Step1:  Subset representative features
+mat_rep <- t(assay(sce)[rep_features, , drop = FALSE])
+
+# Get patient labels
+labels <- as.factor(colData(sce)$Treatment) 
+
+# Make sure rows and labels match
+stopifnot(nrow(mat_rep) == length(labels))
+
+#Step2: Fit logistic regression for each binary task
+# List of disease subgroups
+subgroups <- setdiff(levels(labels), "control")
+
+# Store results
+feature_importance <- list()
+
+library(glmnet)  # optional for regularized logistic regression
+
+for (sg in subgroups) {
+  
+  # Binary labels: 1 = subgroup, 0 = Control
+  binary_labels <- ifelse(labels == sg, 1, 0)
+  
+  # Only keep cells for Control or this subgroup
+  idx <- labels %in% c("control", sg)
+  X <- mat_rep[idx, ]
+  y <- binary_labels[idx]
+  
+  # Fit logistic regression (can add L2 penalty if high-dimensional)
+  model <- glm(y ~ ., data = as.data.frame(X), family = binomial)
+  
+  # Extract absolute coefficients (ignore intercept)
+  coefs <- abs(coef(model)[-1])
+  
+  # Store ranked features
+  feature_importance[[sg]] <- sort(coefs, decreasing = TRUE)
+}
+
+#Step 3: Optional permutation importance
+library(pROC)
+
+perm_importance <- list()
+set.seed(123)
+
+for (sg in subgroups) {
+  
+  # Binary labels
+  binary_labels <- ifelse(labels == sg, 1, 0)
+  idx <- labels %in% c("control", sg)
+  X <- mat_rep[idx, ]
+  y <- binary_labels[idx]
+  
+  # Fit logistic regression
+  model <- glm(y ~ ., data = as.data.frame(X), family = binomial)
+  
+  # Baseline AUC
+  pred <- predict(model, type = "response")
+  auc_base <- auc(y, pred)
+  
+  # Permutation importance
+  imp <- sapply(1:ncol(X), function(j){
+    X_perm <- X
+    X_perm[, j] <- sample(X_perm[, j])  # shuffle feature
+    pred_perm <- predict(model, newdata = as.data.frame(X_perm), type = "response")
+    auc(y, pred_perm) - auc_base  # negative drop = importance
+  })
+  
+  perm_importance[[sg]] <- sort(abs(imp), decreasing = TRUE)
+}
+
+#Step 4: Visualize top features
+# Example for one subgroup
+sg <- subgroups[2]
+
+top_coef <- names(feature_importance[[sg]])[1:10]
+top_perm <- names(perm_importance[[sg]])[1:10]
+
+df_plot <- data.frame(
+  Feature = c(top_coef, top_perm),
+  Importance = c(feature_importance[[sg]][top_coef],
+                 perm_importance[[sg]][top_perm]),
+  Method = rep(c("Coefficient", "Permutation"), each = 10)
+)
+
+ggplot(df_plot, aes(x = reorder(Feature, Importance), y = Importance, fill = Method)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  theme_classic() +
+  ggtitle(paste("Top features for", sg, "vs Control"))
+
+````
+# Plot to see main repeated feature
+
+```{r}
+# Required libraries
+library(pROC)
+library(cowplot)    # for arranging plots
+
+# PARAMETERS
+label_col <- "Treatment"   # change if your metadata column has a different name
+control_label <- "control" # assumed control name; script will fall back to first level if not present
+nperm <- 30                # number of permutations per feature (increase for stability; slower)
+top_n <- 10                # top features to display per method
+min_auc <- 0.6             # only show subgroup if AUC > min_auc
+
+# Prepare data matrix: cells x features
+mat_rep <- t(assay(sce)[rep_features, , drop = FALSE])   # rows = cells, cols = features
+labels <- factor(colData(sce)[[label_col]])
+
+# determine control
+if (!control_label %in% levels(labels)) {
+  control_label <- levels(labels)[1]
+  message("Control label not found; using first level as control: '", control_label, "'")
+}
+subgroups <- setdiff(levels(labels), control_label)
+
+# Storage for plots
+row_plots <- list()
+
+for (sg in subgroups) {
+  idx <- which(labels %in% c(control_label, sg))
+  X <- as.data.frame(mat_rep[idx, , drop = FALSE])
+  y_binary <- ifelse(labels[idx] == sg, 1, 0)
+
+  # fit logistic regression (no regularization). Add tryCatch to handle collinearity issues.
+  df_fit <- cbind(y = y_binary, X)
+  glm_fit <- tryCatch(
+    glm(y ~ ., data = df_fit, family = binomial),
+    error = function(e) {
+      warning("GLM failed for subgroup ", sg, ": ", e$message)
+      return(NULL)
+    }
+  )
+  if (is.null(glm_fit)) next
+
+  # baseline AUC
+  pred_base <- predict(glm_fit, type = "response")
+  auc_base <- as.numeric(auc(y_binary, pred_base))
+
+  # skip if AUC too low
+  if (is.na(auc_base) || auc_base <= min_auc) {
+    message("Skipping ", sg, " (AUC = ", round(auc_base, 3), " <= ", min_auc, ")")
+    next
+  }
+
+  # absolute coefficients (ignore intercept)
+  coefs <- coef(glm_fit)[-1]
+  abs_coefs <- abs(coefs)
+  names(abs_coefs) <- names(coefs)
+
+  # permutation importance: for each feature, compute distribution of AUC drop across nperm shuffles
+  set.seed(123)
+  perm_results <- lapply(seq_len(ncol(X)), function(j) {
+    fname <- colnames(X)[j]
+    drops <- numeric(nperm)
+    for (p in seq_len(nperm)) {
+      Xp <- X
+      Xp[[j]] <- sample(Xp[[j]], size = nrow(Xp), replace = FALSE)
+      pred_p <- predict(glm_fit, newdata = Xp, type = "response")
+      auc_p <- as.numeric(auc(y_binary, pred_p))
+      drops[p] <- auc_base - auc_p   # positive drop = feature important
+    }
+    data.frame(Feature = fname, Drop = drops)
+  })
+  perm_df <- do.call(rbind, perm_results)
+
+  # Get top features by coefficient and by median permutation importance
+  top_coef_feats <- names(sort(abs_coefs, decreasing = TRUE))[1:min(top_n, length(abs_coefs))]
+  perm_medians <- perm_df %>% group_by(Feature) %>% summarize(MedianDrop = median(Drop, na.rm=TRUE))
+  top_perm_feats <- perm_medians %>% arrange(desc(MedianDrop)) %>% slice(1:min(top_n, n())) %>% pull(Feature)
+
+  # Prepare left plot (coefficients)
+  coef_df <- data.frame(Feature = top_coef_feats,
+                        Coef = coefs[top_coef_feats]) %>%
+    mutate(AbsCoef = abs(Coef)) %>%
+    arrange(AbsCoef)
+  p_left <- ggplot(coef_df, aes(x = AbsCoef, y = reorder(Feature, AbsCoef))) +
+    geom_col() +
+    labs(x = "Absolute coefficient", y = NULL, title = "Logistic regression") +
+    theme_minimal() +
+    theme(axis.text.y = element_text(size = 8), plot.title = element_text(hjust = 0.5))
+
+  # Prepare right plot (permutation importance boxplots)
+  perm_plot_df <- perm_df %>% filter(Feature %in% top_perm_feats) %>%
+    mutate(Feature = factor(Feature, levels = rev(top_perm_feats)))
+  p_right <- ggplot(perm_plot_df, aes(x = Drop, y = Feature)) +
+    geom_boxplot(outlier.size = 1) +
+    labs(x = "AUC drop (baseline - permuted)", y = NULL, title = "Permutation importance") +
+    theme_minimal() +
+    theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), plot.title = element_text(hjust = 0.5))
+
+  # Combine left+right into a single row for this subgroup
+  subtitle <- paste0(control_label, " vs ", sg, " (AUC = ", round(auc_base,3), ")")
+  row_combined <- plot_grid(
+    p_left, p_right, ncol = 2, rel_widths = c(0.5, 0.5),
+    labels = c("", ""), align = "h"
+  )
+  row_with_label <- plot_grid(NULL, ggdraw() + draw_label(subtitle, fontface = "bold"), row_combined, ncol = 1, rel_heights = c(0.06, 0.06, 1))
+  row_plots[[sg]] <- row_with_label
+}
+
+# Arrange all rows vertically
+if (length(row_plots) == 0) {
+  stop("No subgroup rows to plot (maybe all AUCs <= min_auc).")
+}
+final_plot <- plot_grid(plotlist = row_plots, ncol = 1)
+
+# Save the final figure
+ggsave("FeatureImportance_grid_TMRM cut0.6.png", final_plot, width = 12, height = 4 * length(row_plots), dpi = 200)
+message("Saved plot to FeatureImportance_grid.png")
+
+````
+Code for violin plots of top features.
+
+```{r}
+
+
+# --- 1. Extract the features and metadata from your SCE ---
+# Replace "tfmfeatures" with your assay name if needed
+mat <- assay(sce, "tfmfeatures")
+
+# Select the features of interest
+selected_features <- c(
+  "Correlation_Manders_CorrTMRM_CorrLyso",
+  "Intensity_MeanIntensityEdge_CorrTMRM"
+)
+
+# Check they exist
+selected_features <- selected_features[selected_features %in% rownames(mat)]
+
+# Combine metadata and feature matrix
+df <- data.frame(
+  as.data.frame(colData(sce)),
+  t(mat[selected_features, , drop = FALSE])
+)
+
+# Ensure metadata columns exist
+stopifnot(all(c("Patient", "Treatment", "Disease") %in% colnames(df)))
+
+# --- 2. Aggregate per Patient, Treatment, Disease ---
+df_patient <- df %>%
+  group_by(Patient, Treatment, Disease) %>%
+  summarise(across(all_of(selected_features), median, na.rm = TRUE), .groups = "drop")
+
+# --- 3. Long format for ggplot ---
+df_long <- df_patient %>%
+  pivot_longer(
+    cols = all_of(selected_features),
+    names_to = "Feature",
+    values_to = "Value"
+  )
+
+# --- 4. Plot per patient ---
+ggplot(df_long, aes(x = Disease, y = Value, fill = Disease)) +
+  geom_violin(scale = "width", trim = FALSE, alpha = 0.7) +
+  geom_boxplot(width = 0.1, outlier.shape = NA, color = "black", alpha = 0.5) +
+  geom_point(
+    aes(color = Patient),
+    position = position_jitter(width = 0.1),
+    size = 1.5,
+    alpha = 0.8
+  ) +
+  facet_grid(Feature ~ Treatment, scales = "free_y") +
+  theme_bw(base_size = 12) +
+  labs(
+    title = "Median feature values per Patient across Disease and Treatment",
+    x = "Disease group",
+    y = "Median feature value per patient"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text.y = element_text(face = "bold"),
+    strip.text.x = element_text(face = "bold"),
+    legend.position = "none"
+  )
+
+````
