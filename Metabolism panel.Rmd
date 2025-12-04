@@ -24,6 +24,10 @@ library(MultiAssayExperiment)
 library(lme4)
 library(lmerTest)
 library(ggrepel)
+library(ggpubr)
+library(viridis)
+library(rstatix)
+library(RColorBrewer)
 n_threads <- 16
 
 ```
@@ -44,7 +48,7 @@ files_met <- c(
 sce <- Reduce(cbind, lapply(files_met, loadData))
 
 ```
-Path to files.
+Path to files.-> develop panel exp.
 
 ```{r}
 # path to files
@@ -76,7 +80,7 @@ data_transformation <- function(sce) {
     sce_plate <- removeNAs(sce_plate)
     
     # remove outlier images
-    sce_plate <- removeOutliers(sce_plate, min = 30, max = 300)
+    sce_plate <- removeOutliers(sce_plate, min = 5, max = 100)
     
     # remove outlier cells
     stats <- perCellQCMetrics(sce_plate, assay.type = "features")
@@ -85,12 +89,15 @@ data_transformation <- function(sce) {
     # remove features with zero spread
     sce_plate <- removeLowVariance(sce_plate, robust = TRUE)
     
+    # remove zero-inflated features
+    sce_plate <- removeZeroInflation(sce_plate)
+    
     # transform non-negatives features and scale all features
     sce_plate <- transformLogScale(sce_plate, robust = TRUE)
   
-    # fix factors, code from ChatGPT
-sce_plate$Treatment <- factor(sce_plate$Treatment, levels = unique(sce$Treatment))
-sce_plate$Treatment <- relevel(sce_plate$Treatment, ref = "control")
+    # fix factors
+    sce_plate$Treatment <- as.factor(sce_plate$Treatment)
+    sce_plate$Treatment <- relevel(sce_plate$Treatment, ref = "control")
     
     sce_plate
   
@@ -128,6 +135,934 @@ sce_aggr <- aggregateAcrossCells(
   )
 
 ```
+#compare by Disease -> select feature that drive differences?code from CHAT
+
+````{r}
+sce_sub <- sce_aggr[, sce_aggr$Treatment == "control"]
+
+# if include every feature
+# Extract ALL features from tfmfeatures assay
+all_features_mat <- assay(sce_sub, "tfmfeatures")
+
+# Transpose so rows = cells, columns = features
+all_features_data <- as.data.frame(t(all_features_mat))
+
+# Metadata
+meta <- as.data.frame(colData(sce_sub)[, c("Patient", "Disease", "Treatment", "Plate")])
+
+# Combine metadata and features
+df <- cbind(meta, all_features_data)
+
+# ANOVA / Kruskal-Wallis (nonparametric)
+# to select single feature differ among diseases.
+
+## for Intensity feature
+results <- df %>%
+  pivot_longer(cols = starts_with("Intensity_"), names_to = "Feature", values_to = "Value") %>%
+  group_by(Feature) %>%
+  kruskal_test(Value ~ Disease) %>%
+  adjust_pvalue(method = "bonferroni") %>%
+  arrange(p.adj)
+
+# then Post-hoc pairwise test
+pairwise <- df %>%
+  pivot_longer(cols = starts_with("Intensity_"), names_to = "Feature", values_to = "Value") %>%
+  group_by(Feature) %>%
+  pairwise_wilcox_test(Value ~ Disease, p.adjust.method = "bonferroni")
+
+## for all feature
+# results <- df %>%
+#   pivot_longer(
+#     cols = -c(Patient, Disease, Treatment, Plate),  # pivot all other columns
+#     names_to = "Feature",
+#     values_to = "Value"
+#   ) %>%
+#   group_by(Feature) %>%
+#   kruskal_test(Value ~ Disease) %>%
+#   adjust_pvalue(method = "bonferroni") %>%
+#   arrange(p.adj)
+# 
+# # --- Pairwise post-hoc test ---
+# pairwise <- df %>%
+#   pivot_longer(
+#     cols = -c(Patient, Disease, Treatment, Plate),
+#     names_to = "Feature",
+#     values_to = "Value"
+#   ) %>%
+#   group_by(Feature) %>%
+#   pairwise_wilcox_test(Value ~ Disease, p.adjust.method = "bonferroni")
+
+top_features <- results %>% filter(p.adj < 0.05) %>% arrange(p.adj)
+head(top_features)
+
+top10_feature_names <- top_features$Feature[1:15]
+
+# Filter df for top 10 features
+df_top10 <- df %>%
+  select(Patient, Disease, all_of(top10_feature_names)) %>%
+  pivot_longer(cols = all_of(top10_feature_names),
+               names_to = "Feature",
+               values_to = "Value")
+
+# Summarize per patient (mean per patient)
+df_plot <- df_top10 %>%
+  group_by(Patient, Disease, Feature) %>%
+  summarise(MeanValue = mean(Value), .groups = "drop")
+
+
+# Plot with bars for group mean and dots for patients
+df_summary <- df_plot %>%
+  group_by(Disease, Feature) %>%
+  summarise(GroupMean = mean(MeanValue), .groups = "drop")
+
+pairwise_top <- pairwise %>%
+  filter(Feature %in% top10_feature_names) %>%
+  mutate(
+    p_label = case_when(
+      p.adj <= 0.001 ~ "***",
+      p.adj <= 0.01  ~ "**",
+      p.adj <= 0.05  ~ "*",
+      TRUE ~ "ns"
+    )
+  )
+
+# --- 2. Loop over top features to plot individually ---
+for (f in top10_feature_names) {
+  
+  df_f <- df_plot %>% filter(Feature == f)
+  df_sum_f <- df_summary %>% filter(Feature == f)
+  stats_f <- pairwise_top %>% filter(Feature == f)
+  
+  # Skip if no results
+  if (nrow(stats_f) == 0) {
+    message(paste("⚠️ Skipping", f, "- no pairwise test results found."))
+    next
+  }
+  
+  # --- Add y positions for each comparison dynamically ---
+  y_max <- max(df_f$MeanValue, na.rm = TRUE)
+  stats_f <- stats_f %>%
+    arrange(p.adj) %>%
+    mutate(
+      y.position = seq(y_max * 1.05, y_max * 1.05 + (n() - 1) * (y_max * 0.1), length.out = n())
+    )
+  
+  # --- Plot ---
+  p <- ggplot() +
+    geom_bar(
+      data = df_sum_f,
+      aes(x = Disease, y = GroupMean, fill = Disease),
+      stat = "identity", alpha = 0.4, width = 0.6, color = "black"
+    ) +
+    geom_jitter(
+      data = df_f,
+      aes(x = Disease, y = MeanValue, color = Disease),
+      width = 0.15, size = 3, alpha = 0.9
+    ) +
+    stat_pvalue_manual(
+      stats_f,
+      label = "p_label",
+      tip.length = 0.01,
+      hide.ns = TRUE,
+      size = 8,
+      bracket.size = 0.8,
+      step.increase = 0.08   # stagger brackets automatically
+    ) +
+    scale_fill_brewer(palette = "Set2") +
+    scale_color_brewer(palette = "Set2") +
+    theme_bw(base_size = 20) +
+    labs(
+      title = paste0("Feature: ", f),
+      y = "Mean Intensity per Patient",
+      x = "Disease"
+    ) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 20),
+      axis.title = element_text(face = "bold", size = 16),
+      axis.text = element_text(size = 16),
+      legend.position = "none"
+    )
+  # --- Save each plot ---
+  file_base <- gsub("[:/\\s]", "_", f)  # clean feature name for filename
+  ggsave(
+    filename = paste0("Plot_", file_base, ".tiff"),
+    plot = p,
+    width = 6,
+    height = 6,
+    units = "in",
+    dpi = 600,
+    compression = "lzw"
+  )
+  print(p)
+}
+
+
+````
+# Feature importance analysis _ code base on carpenter-singh-lab
+
+````{r}
+# --- 1️⃣ Load required packages ---
+library(SingleCellExperiment)
+library(dplyr)
+library(ggplot2)
+library(randomForest)
+library(car)       # for VIF
+library(caret)     # optional for data preprocessing
+
+# --- 2️⃣ User-adjustable parameters ---
+assay_name <- "tfmfeatures"        # assay name
+target_var <- "Treatment"          # "Treatment" or "Disease"
+comparison_levels <- c("control", "IL1")   # groups to compare
+feature_keyword <- "Corr"              # e.g. "Intensity" or "" for all
+topN <- 10                         # number of features to plot
+cor_threshold <- 0.7               # correlation clustering depth
+vif_limit <- 10                    # VIF limit
+use_vif <- TRUE                    # ✅ toggle ON/OFF for VIF filtering
+set.seed(123)
+
+# --- 3️⃣ Extract features + metadata ---
+features <- as.data.frame(t(assay(sce_aggr, assay_name)))
+meta <- as.data.frame(colData(sce_aggr)[, c("Patient", "Disease", "Treatment", "Plate")])
+df <- cbind(meta, features)
+
+# --- 4️⃣ Filter for comparison groups ---
+df <- df %>%
+    filter(.data[[target_var]] %in% comparison_levels) %>%
+    mutate(across(all_of(target_var), ~ factor(.x, levels = comparison_levels)))
+
+# --- 5️⃣ Select features (optional keyword filtering) ---
+if (feature_keyword != "") {
+    selected_features <- grep(feature_keyword, colnames(df), value = TRUE)
+    if (length(selected_features) == 0) stop(paste0("❌ No features found containing keyword: ", feature_keyword))
+    X <- df %>% select(all_of(selected_features))
+} else {
+    X <- df %>% select(where(is.numeric))
+}
+y <- df[[target_var]]
+
+# --- 6️⃣ Compute Pearson correlation + clustering ---
+cor_mat <- cor(X, use = "pairwise.complete.obs", method = "pearson")
+dist_mat <- as.dist(1 - abs(cor_mat))
+hc <- hclust(dist_mat, method = "average")
+
+# --- 7️⃣ Form clusters based on correlation distance threshold ---
+clusters <- cutree(hc, h = (1 - cor_threshold))
+cluster_df <- data.frame(Feature = names(clusters), Cluster = clusters)
+
+# --- 8️⃣ Pick representative feature per cluster ---
+representative_features <- cluster_df %>%
+    group_by(Cluster) %>%
+    summarise(Representative = Feature[ceiling(length(Feature) / 2)], .groups = "drop")
+
+X_reduced <- X[, representative_features$Representative, drop = FALSE]
+
+# --- 9️⃣ (Optional) Check VIF for multicollinearity ---
+if (use_vif && ncol(X_reduced) <= 1000) {
+    message("🔍 Checking VIF for multicollinearity...")
+    
+    dummy_y <- rnorm(nrow(X_reduced))  # dummy numeric response
+    df_vif <- data.frame(dummy_y, X_reduced)
+    
+    vif_values <- tryCatch({
+        model <- lm(dummy_y ~ ., data = df_vif)
+        vif(model)
+    }, error = function(e) {
+        message("⚠️ Skipping VIF filtering due to computation error: ", e$message)
+        NULL
+    })
+    
+    if (!is.null(vif_values)) {
+        keep <- names(vif_values[vif_values < vif_limit])
+        if (length(keep) > 0) {
+            X_reduced <- X_reduced[, keep, drop = FALSE]
+            message("✅ Retained ", length(keep), " features after VIF filtering.")
+        } else {
+            message("⚠️ No features passed VIF filtering; skipping this step.")
+        }
+    }
+} else if (!use_vif) {
+    message("ℹ️ VIF filtering skipped (use_vif = FALSE).")
+} else {
+    message("⚠️ Skipping VIF filtering due to large feature count (", ncol(X_reduced), ").")
+}
+
+# --- 🔟 Random Forest on reduced features ---
+rf_model <- randomForest(
+    x = X_reduced,
+    y = y,
+    importance = TRUE,
+    ntree = 1000
+)
+
+importance_df <- as.data.frame(importance(rf_model, type = 1))
+importance_df$Feature <- rownames(importance_df)
+importance_df <- importance_df %>% arrange(desc(MeanDecreaseAccuracy))
+
+# --- 11️⃣ Build title + filename ---
+comparison_str <- paste(comparison_levels, collapse = "_vs_")
+feature_str <- if (feature_keyword != "") paste0("_", feature_keyword) else ""
+
+plot_title <- paste0(
+    "Top ", topN, " Representative Features for ", target_var,
+    " (", comparison_str, ")", feature_str
+)
+
+file_name <- paste0(
+    "TopFeatures_", target_var, "_", comparison_str, feature_str, ".tiff"
+)
+file_name <- gsub("\\s+", "_", file_name)  # clean spaces
+
+# --- 12️⃣ Plot top features ---
+top_features_plot <- ggplot(importance_df[1:topN, ], aes(
+    x = reorder(Feature, MeanDecreaseAccuracy),
+    y = MeanDecreaseAccuracy
+)) +
+    geom_bar(stat = "identity", fill = "steelblue") +
+    coord_flip() +
+    theme_bw(base_size = 18) +
+    labs(
+        title = plot_title,
+        x = "Representative Feature",
+        y = "Importance (Mean Decrease Accuracy)"
+    ) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.05)))
+
+# --- 13️⃣ Save publication-quality plot ---
+ggsave(
+    filename = file_name,
+    plot = top_features_plot,
+    width = 8,
+    height = 6,
+    dpi = 600,
+    units = "in",
+    device = "tiff"
+)
+
+cat("✅ Saved high-resolution plot as:", file_name, "\n")
+
+````
+# plot top feature from Feature Importance analysis
+
+````{r}
+
+
+# --- 1️⃣ Prepare Data ---
+top_features <- importance_df$Feature[1:topN]
+
+# Extract features and metadata
+features <- as.data.frame(t(assay(sce, assay_name)))
+meta <- as.data.frame(colData(sce)[, c("Patient", "Disease", "Treatment", "Plate")])
+df <- cbind(meta, features)
+
+# Filter for control and IL1 treatments
+df <- df %>% filter(Treatment %in% c("control", "IL1"))
+
+# Convert to long format
+df_long <- df %>%
+  select(Patient, Disease, Treatment, all_of(top_features)) %>%
+  pivot_longer(
+    cols = all_of(top_features),
+    names_to = "Feature",
+    values_to = "Value"
+  )
+
+# Summarize to patient level
+df_patient_mean <- df_long %>%
+  group_by(Patient, Disease, Treatment, Feature) %>%
+  summarise(MeanValue = mean(Value, na.rm = TRUE), .groups = "drop")
+
+# Group mean for bars
+df_group_mean <- df_patient_mean %>%
+  group_by(Disease, Treatment, Feature) %>%
+  summarise(GroupMean = mean(MeanValue, na.rm = TRUE), .groups = "drop")
+
+# --- 2️⃣ Create folder for saving ---
+dir.create("TopFeatures_TreatmentFacet_IL1", showWarnings = FALSE)
+
+# --- 3️⃣ Loop through each feature and save individual plot ---
+for (f in top_features) {
+  
+  df_f_patient <- df_patient_mean %>% filter(Feature == f)
+  df_f_group <- df_group_mean %>% filter(Feature == f)
+  
+  p_f <- ggplot() +
+    geom_bar(
+      data = df_f_group,
+      aes(x = Disease, y = GroupMean, fill = Disease),
+      stat = "identity",
+      alpha = 0.4,
+      width = 0.6,
+      color = "black"
+    ) +
+    geom_jitter(
+      data = df_f_patient,
+      aes(x = Disease, y = MeanValue, color = Disease),
+      width = 0.15,
+      size = 3,
+      alpha = 0.9
+    ) +
+    facet_wrap(~ Treatment, ncol = 2, scales = "fixed") +
+    theme_bw(base_size = 18) +
+    labs(
+      title = paste0(f, " across Diseases (faceted by Treatment)"),
+      x = "Disease",
+      y = "Mean Feature Value per Patient"
+    ) +
+    scale_fill_brewer(palette = "Set2") +
+    scale_color_brewer(palette = "Set2") +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+      axis.title = element_text(face = "bold", size = 16),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+      strip.text = element_text(size = 14, face = "bold"),
+      legend.position = "none"
+    )
+  
+  # --- 4️⃣ Save TIFF ---
+  ggsave(
+    filename = paste0("TopFeatures_TreatmentFacet_IL1/", f, "_Disease_TreatmentFacet.tiff"),
+    plot = p_f,
+    width = 7,
+    height = 5,
+    dpi = 600,
+    units = "in"
+  )
+  
+  message("✅ Saved: ", f)
+}
+
+cat("\n✅ All individual TIFF plots saved in 'TopFeatures_TreatmentFacet_IL1' folder.\n")
+
+
+````
+
+#correlation of metabolism for disease
+
+````{r}
+# df from previous step
+
+df_plot <- df %>%
+  select(Patient, Disease, Treatment,
+         Intensity_MeanIntensity_CorrLipid,
+         Intensity_MeanIntensity_CorrMitosox)
+
+custom_colors <- c(
+  "Healthy" = "#1b9e77",
+  "OA" = "#d95f02",
+  "RA" = "#7570b3"
+)
+
+# Plot correlation (Spearman) faceted by Disease
+p_corr <- ggpubr::ggscatter(
+  df_plot,
+  x = "Intensity_MeanIntensity_CorrLipid",
+  y = "Intensity_MeanIntensity_CorrMitosox",
+  color = "Disease",                 # color by Disease
+  palette = custom_colors,
+  add = "reg.line",
+  conf.int = TRUE,
+  cor.coef = TRUE,
+  cor.method = "spearman",
+  add.params = list(color = "gray30", fill = "lightgray"),
+  cor.coef.size = 6,   # Font size of correlation text
+  cor.coeff.args = list(
+    label.x.npc = "center",
+    label.y.npc = "top",
+    color = "black",
+    fontface = "bold"
+  ),
+  xlab = "Mean Intensity (LipidTOX)",
+  ylab = "Mean Intensity (MitoSOX)",
+  title = "Correlation between LipidTOX and MitoSOX intensities per Disease"
+) +
+  facet_wrap(~Disease, scales = "free") +  # facet by Disease
+  theme_bw(base_size = 16) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    axis.title = element_text(face = "bold", size = 16),
+    legend.position = "right",
+    strip.text = element_text(face = "bold", size = 14)
+  )
+
+# Display plot
+p_corr
+
+````
+
+#correlation of metabolism for Treatment
+
+````{r}
+# df from previous step
+
+library(ggpubr)
+library(ggplot2)
+library(dplyr)
+
+# --- 1️⃣ Filter data for desired treatments ---
+comparison_levels <- c("control", "IL1")
+
+df_plot <- df %>%
+    filter(Treatment %in% comparison_levels) %>%
+    select(Patient, Disease, Treatment,
+           Intensity_MeanIntensity_CorrEdU,
+           Intensity_MaxIntensity_CorrMitosox)
+
+# --- 2️⃣ Custom colors ---
+custom_colors <- c(
+    "Healthy" = "#1b9e77",
+    "OA" = "#d95f02",
+    "RA" = "#7570b3"
+)
+
+# --- 3️⃣ Plot ---
+p_corr <- ggpubr::ggscatter(
+    df_plot,
+    x = "Intensity_MeanIntensity_CorrEdU",
+    y = "Intensity_MaxIntensity_CorrMitosox",
+    color = "Disease",
+    palette = custom_colors,
+    add = "reg.line",
+    conf.int = TRUE,
+    cor.coef = TRUE,
+    cor.method = "spearman",
+    add.params = list(color = "gray30", fill = "lightgray"),
+    cor.coef.size = 5,
+    cor.coeff.args = list(
+    label.x.npc = "center",   # horizontally centered
+    label.y.npc = "center",   # vertically centered (safe value)
+    label.sep = "\n",         # ✅ separate rho and p-value into two lines
+    color = "black",
+    fontface = "bold",
+    size = 6
+  ),
+    xlab = "Mean Intensity (EdU)",
+    ylab = "Max Intensity (MitoSOX)",
+    title = "Correlation between EdU and MitoSOX Intensities"
+) +
+    facet_wrap(Treatment ~ Disease, scales = "free") +
+    theme_bw(base_size = 18) +
+    theme(
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 20),
+        axis.title = element_text(face = "bold", size = 16),
+        axis.text = element_text(size = 14),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 13),
+        strip.text = element_text(face = "bold", size = 15),
+        plot.margin = unit(c(10, 20, 20, 20), "pt"),     # ✅ added "pt"
+        panel.spacing = unit(1.2, "lines")
+    ) +
+    coord_cartesian(clip = "off")  # ✅ ensures correlation text isn't cut
+
+# --- 4️⃣ Save high-res image ---
+ggsave(
+    filename = "Corr_EdU_MitoSOX_byTreatment.png",
+    plot = p_corr,
+    width = 11,
+    height = 6,
+    dpi = 600,
+    bg = "white",
+    limitsize = FALSE
+)
+
+## correlation from Importance feature analysis
+
+library(reshape2)
+
+top_features <- importance_df %>%
+  slice_max(order_by = MeanDecreaseAccuracy, n = 16) %>%
+  pull(Feature)
+
+# --- 2️⃣ Optionally filter only CorrMitosox / CorrLipid if needed ---
+top_features <- grep("CorrMitosox|CorrLipid", top_features, value = TRUE, invert = FALSE) #|CorrEdU
+# set invert = TRUE if you want to exclude them instead
+
+# --- 2️⃣ Subset the data ---
+df_corr <- X_reduced[, top_features, drop = FALSE]
+
+# --- 3️⃣ Compute Pearson correlation ---
+cor_mat <- cor(df_corr, use = "pairwise.complete.obs", method = "pearson")
+
+# --- 4️⃣ Melt for ggplot ---
+# Mask upper triangle
+cor_mat[upper.tri(cor_mat)] <- NA
+corr_melt <- melt(cor_mat, na.rm = TRUE)
+colnames(corr_melt) <- c("Feature1", "Feature2", "Correlation")
+
+# --- 5️⃣ Plot heatmap ---
+heatmap_plot <- ggplot(corr_melt, aes(x = Feature1, y = Feature2, fill = Correlation)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0,
+                       limits = c(-1,1), name = "Pearson r") +
+  geom_text(aes(label = round(Correlation, 2)), color = "black", size = 4) +
+  theme_minimal(base_size = 16) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title = element_blank())
+
+# --- 6️⃣ Save high-resolution plot ---
+
+ggsave("Correlation_Heatmap_CorrFeatures.png", heatmap_plot, width = 10, height = 8, dpi = 300)
+
+heatmap_plot
+
+````
+# for develpoment panel -> single cell plot
+
+````{r}
+
+intensity_data <- as.data.frame(t(assay(sce, "tfmfeatures")))
+intensity_features <- c(
+                                    "Intensity_MeanIntensity_CorrMitosox", 
+                                    "Intensity_MeanIntensity_CorrLipid", 
+                                    "Intensity_MeanIntensity_CorrEdU", 
+                                    "Intensity_IntegratedIntensity_CorrMitosox",
+                                    "Intensity_IntegratedIntensity_CorrLipid",
+                                    "Intensity_IntegratedIntensity_CorrEdU"
+)
+intensity_data <- intensity_data[, intensity_features, drop = FALSE]
+
+metadata <- as.data.frame(colData(sce)[, c("Patient", "Treatment", "Disease", "Joint", "Plate")])
+df <- cbind(metadata, intensity_data)
+
+df <- df %>% filter(Disease == "healthy")
+
+df_long <- df %>%
+  pivot_longer(
+    cols = all_of(intensity_features),
+    names_to = "Feature",
+    values_to = "Intensity"
+  )
+
+ref_treatment <- "cont"
+treatment_colors <- RColorBrewer::brewer.pal(n = length(unique(df_long$Treatment)), name = "Set2")
+names(treatment_colors) <- unique(df_long$Treatment)
+
+# 7. Loop through all features and plot
+for (f in unique(df_long$Feature)) {
+  df_plot <- df_long %>% filter(Feature == f)
+
+  # Statistical test (Wilcoxon, Bonferroni)
+  stat.test <- ggpubr::compare_means(
+    Intensity ~ Treatment,
+    data = df_plot,
+    method = "wilcox.test",
+    ref.group = ref_treatment,
+    p.adjust.method = "bonferroni"
+  )
+
+  # Assign y positions for stars
+  stat.test <- stat.test %>%
+    mutate(
+      y.position = max(df_plot$Intensity, na.rm = TRUE) + 
+        (1:n()) * (0.05 * diff(range(df_plot$Intensity, na.rm = TRUE)))
+    )
+
+  # Plot
+  p <- ggplot(df_plot, aes(x = Treatment, y = Intensity, fill = Treatment)) +
+    geom_violin(trim = FALSE, alpha = 0.35, color = "gray40", width = 0.9) +
+    geom_boxplot(width = 0.15, outlier.shape = NA, alpha = 0.7, color = "black") +
+    geom_jitter(aes(color = Treatment), size = 1.2, width = 0.2, alpha = 0.4) +
+    scale_fill_manual(values = treatment_colors) +
+    scale_color_manual(values = treatment_colors) +
+    labs(
+      title = paste("Single-cell intensity (Healthy) —", f),
+      y = "Z-scored log intensity",
+      x = "Treatment",
+      color = "Treatment",
+      fill = "Treatment"
+    ) +
+    theme_bw(base_size = 18) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 20),
+      axis.title = element_text(size = 18, face = "bold"),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 16),
+      axis.text.y = element_text(size = 14),
+      legend.position = "right",
+      panel.grid = element_blank()
+    ) +
+    stat_pvalue_manual(
+      stat.test,
+      label = "p.signif",  # show stars instead of p values
+      size = 6,
+      tip.length = 0.01
+    )
+
+  print(p)
+}
+
+## for comparison cont VS positive control
+
+library(RColorBrewer)
+
+palette_set2 <- brewer.pal(8, "Set2")  # up to 8 colors available
+treatment_colors <- c("cont" = palette_set2[1], "MG" = palette_set2[2])
+
+# --- Loop for selected features ---
+for (f in unique(df_long$Feature)) {
+  
+  # Only plot Lipid, Mitosox, or EdU
+  if (grepl("Lipid|Mitosox|EdU", f)) {
+    df_plot <- df_long %>% 
+      filter(Feature == f, Treatment %in% c("cont", "MG"))
+    ref_treatment <- "cont"
+  } else {
+    next
+  }
+
+  # Drop unused factor levels (important!)
+  df_plot <- droplevels(df_plot)
+
+  # --- Statistical test ---
+  stat.test <- ggpubr::compare_means(
+    Intensity ~ Treatment,
+    data = df_plot,
+    method = "wilcox.test",
+    ref.group = ref_treatment,
+    p.adjust.method = "bonferroni"
+  )
+
+  # --- Adjust y-axis dynamically ---
+  y_max <- max(df_plot$Intensity, na.rm = TRUE)
+  y_min <- min(df_plot$Intensity, na.rm = TRUE)
+  y_range <- y_max - y_min
+  
+  stat.test <- stat.test %>%
+    mutate(
+      y.position = y_max + (1:n()) * (0.05 * y_range)
+    )
+
+  # --- Plot ---
+  p <- ggplot(df_plot, aes(x = Treatment, y = Intensity, fill = Treatment)) +
+    geom_violin(trim = FALSE, alpha = 0.35, color = "gray40", width = 0.9) +
+    geom_boxplot(width = 0.15, outlier.shape = NA, alpha = 0.7, color = "black") +
+    geom_jitter(aes(color = Treatment), size = 1.2, width = 0.2, alpha = 0.4) +
+    scale_fill_manual(values = treatment_colors) +
+    scale_color_manual(values = treatment_colors) +
+    labs(
+      title = paste("Single-cell intensity (Healthy) —", f),
+      y = "Z-scored log intensity",
+      x = "Treatment",
+      color = "Treatment",
+      fill = "Treatment"
+    ) +
+    theme_bw(base_size = 18) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 20),
+      axis.title = element_text(size = 18, face = "bold"),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 16),
+      axis.text.y = element_text(size = 14),
+      legend.position = "right",
+      panel.grid = element_blank()
+    ) +
+    stat_pvalue_manual(
+      stat.test,
+      label = "p.signif",
+      size = 6,
+      tip.length = 0.01
+    ) +
+    coord_cartesian(ylim = c(y_min - 0.05 * y_range, y_max + 0.15 * y_range))
+
+  print(p)
+}
+
+````
+#for develpoment panel -> EdU
+
+````{r}
+# Subset EdU data
+df_edu <- df %>%
+  filter(Treatment %in% c("cont", "MG")) %>%
+  select(Treatment, Intensity_MeanIntensity_CorrEdU)
+
+# Plot histogram
+ggplot(df_edu, aes(x = Intensity_MeanIntensity_CorrEdU, fill = Treatment)) +
+  geom_histogram(alpha = 0.6, bins = 50, position = "identity") +
+  scale_fill_manual(values = c("cont" = brewer.pal(8, "Set2")[1],
+                               "MG"   = brewer.pal(8, "Set2")[2])) +
+  labs(
+    title = "Distribution of EdU Mean Intensity (Healthy)",
+    x = "Mean Intensity (EdU)",
+    y = "Cell Count"
+  ) +
+  theme_bw(base_size = 16) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    legend.position = "right"
+  )
+
+cutoff <- 3  # 🔸 adjust this based on the histogram
+
+edu_summary <- df_edu %>%
+  mutate(Positive = Intensity_MeanIntensity_CorrEdU > cutoff) %>%
+  group_by(Treatment) %>%
+  summarise(
+    Percent_Positive = mean(Positive) * 100,
+    .groups = "drop"
+  )
+
+print(edu_summary)
+
+# ---- Plot bar graph ----
+palette_set2 <- brewer.pal(8, "Set2")
+treatment_colors <- c("cont" = palette_set2[1], "MG" = palette_set2[2])
+
+ggplot(edu_summary, aes(x = Treatment, y = Percent_Positive, fill = Treatment)) +
+  geom_bar(stat = "identity", width = 0.7, color = "black") +
+  geom_text(aes(label = sprintf("%.1f%%", Percent_Positive)), vjust = -0.5, size = 5) +
+  scale_fill_manual(values = treatment_colors) +
+  labs(
+    title = paste0("Percentage of EdU-positive Cells (Cutoff = ", cutoff, ")"),
+    x = "Treatment",
+    y = "% EdU-positive Cells"
+  ) +
+  ylim(0, max(edu_summary$Percent_Positive) * 1.2) +
+  theme_bw(base_size = 16) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    axis.title = element_text(size = 16, face = "bold"),
+    axis.text = element_text(size = 14),
+    legend.position = "none"
+  )
+
+## correlation compare edu pos and neg
+
+df_corr <- df %>%
+  filter(Treatment %in% c("cont", "MG")) %>%
+  select(Treatment,
+         Intensity_MeanIntensity_CorrEdU,
+         Intensity_MeanIntensity_CorrLipid,
+         Intensity_MeanIntensity_CorrMitosox)
+
+# --- 2. Define cutoff for EdU positivity ---
+cutoff <- 3  # you can adjust this
+df_corr <- df_corr %>%
+  mutate(
+    EdU_Status = ifelse(Intensity_MeanIntensity_CorrEdU > cutoff, "EdU_Positive", "EdU_Negative")
+  )
+
+# --- 3. Plot correlation between Lipid and MitoSOX per EdU status ---
+ggplot(df_corr, aes(x = Intensity_MeanIntensity_CorrLipid,
+                    y = Intensity_MeanIntensity_CorrMitosox,
+                    color = Treatment)) +
+  geom_point(alpha = 0.5, size = 2) +
+  geom_smooth(method = "lm", se = TRUE, color = "black") +
+  facet_wrap(~ EdU_Status, scales = "free") +
+  stat_cor(method = "spearman", 
+           aes(label = paste0("ρ = ", ..r.., "\nP = ", ..p..)),
+           size = 6, 
+           label.x.npc = "center", 
+           label.y.npc = 0.2) +
+  scale_color_manual(values = c("cont" = brewer.pal(8, "Set2")[1],
+                                "MG"   = brewer.pal(8, "Set2")[2])) +
+  labs(
+    title = "Correlation between Lipid and MitoSOX Intensity",
+    subtitle = "Separated by EdU-positive and EdU-negative cells",
+    x = "Lipid Mean Intensity",
+    y = "MitoSOX Mean Intensity"
+  ) +
+  theme_bw(base_size = 16) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    strip.text = element_text(size = 16, face = "bold"),
+    legend.position = "top"
+  )
+````
+
+# for develpoment panel -> correlation plot for lipid
+
+````{r}
+library(RColorBrewer)
+
+
+df_corr <- df %>%
+  filter(Disease == "healthy") %>%
+  filter(Treatment %in% c("cont", "MG")) %>%  # <--- keep only these two groups
+  select(Treatment, Intensity_MeanIntensity_CorrLipid, Intensity_MeanIntensity_CorrMitosox)
+
+set2_colors <- RColorBrewer::brewer.pal(n = length(unique(df_corr$Treatment)), name = "Set2")
+
+custom_colors <- c("cont" = set2_colors[1], "MG" = set2_colors[2])
+
+# --- Scatter plot with correlation test ---
+p_corr <- ggpubr::ggscatter(
+  df_corr,
+  x = "Intensity_MeanIntensity_CorrLipid",
+  y = "Intensity_MeanIntensity_CorrMitosox",
+  color = "Treatment",
+  palette = custom_colors,
+  add = "reg.line",
+  conf.int = TRUE,
+  cor.coef = TRUE,
+  cor.method = "spearman",
+  add.params = list(color = "gray30", fill = "lightgray"),
+  cor.coef.size = 6,   # Increase font size of correlation text
+  cor.coeff.args = list(
+    label.x.npc = "center",  # Horizontal position ("left", "center", or "right")
+    label.y.npc = "top",  # Vertical position ("bottom", "center", or "top")
+    color = "black",         # Optional: set color of correlation label
+    fontface = "bold"        # Optional: make it bold
+  ),
+  xlab = "Mean Intensity (LipidTOX)",
+  ylab = "Mean Intensity (Mitosox)",
+  title = "Correlation between LipidTOX and Mitosox intensities (Healthy)"
+) +
+  facet_wrap(~Treatment) +
+  theme_bw(base_size = 16) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    axis.title = element_text(face = "bold", size = 16),
+    legend.position = "right"
+  )
+
+print(p_corr)
+
+# split EdU poppulation
+# --- PARAMETERS ---
+cutoff <- 3   # adjust based on your histogram
+palette_set2 <- brewer.pal(8, "Set2")
+treatment_colors <- c("cont" = palette_set2[1], "MG" = palette_set2[2])
+
+# --- 1. Add EdU status ---
+df_corr <- df %>%
+  filter(Treatment %in% c("cont", "MG")) %>%
+  mutate(
+    EdU_status = ifelse(Intensity_MeanIntensity_CorrEdU > cutoff, "EdU+", "EdU-")
+  )
+
+# --- 2. Loop through each EdU status and plot correlation ---
+for (edu_group in c("EdU+", "EdU-")) {
+  
+  df_sub <- df_corr %>%
+    filter(EdU_status == edu_group)
+  
+  # --- 3. Plot correlation between Mitosox and Lipid ---
+  p_corr <- ggscatter(
+    df_sub,
+    x = "Intensity_MeanIntensity_CorrLipid",
+    y = "Intensity_MeanIntensity_CorrMitosox",
+    color = "Treatment",
+    palette = treatment_colors,
+    add = "reg.line",
+    conf.int = TRUE,
+    cor.coef = TRUE,
+    cor.method = "spearman",
+    facet.by = "Treatment",      # show cont vs MG separately
+    title = paste0("Correlation (", edu_group, " cells)"),
+    xlab = "Mean Intensity (Lipid)",
+    ylab = "Mean Intensity (Mitosox)"
+  ) +
+    theme_bw(base_size = 16) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+      axis.title = element_text(size = 15, face = "bold"),
+      axis.text = element_text(size = 13),
+      legend.position = "right"
+    )
+  
+  print(p_corr)
+}
+
+
+````
 #explore each markers in details (only Intensity data)
 
 ````{r}
@@ -183,8 +1118,16 @@ for (f in features) {
     geom_point(aes(shape = Plate, color = Treatment),
                position = position_jitter(width = 0.1),
                size = 3.5, stroke = 1, alpha = 0.9) +
+    geom_text_repel(
+    aes(label = Patient, color = Treatment),
+    size = 3.5,
+    position = position_jitter(width = 0.15),
+    show.legend = FALSE,
+    max.overlaps = 30
+    ) +
     facet_wrap(~ Disease, scales = "fixed") +
-    theme_bw(base_size = 14) +
+    coord_cartesian(ylim = c(-2, 2)) +
+    theme_bw(base_size = 16) +
     labs(
       title = paste("Z-scored log-transformed feature intensities per Treatment_", f),
       y = "Z-scored log intensity", #Mean Intensity (a.u.)
@@ -199,16 +1142,150 @@ for (f in features) {
    print(p) 
 }
 
+# --- Mean & SD summary ---
+df_stats <- df_summary %>%
+  group_by(Disease, Feature, Treatment) %>%
+  summarise(
+    Mean = mean(MeanIntensity, na.rm = TRUE),
+    SD = sd(MeanIntensity, na.rm = TRUE),
+    N = n(),
+    .groups = "drop"
+  )
+
+# --- Pairwise Wilcoxon test (vs. control) ---
+# Set this flag: TRUE = use Bonferroni-adjusted p-values, FALSE = use raw p-values
+use_adjusted <- FALSE
+
+stat_results <- df_summary %>%
+  group_by(Disease, Feature) %>%
+  pairwise_wilcox_test(
+    MeanIntensity ~ Treatment,
+    p.adjust.method = "bonferroni",
+    ref.group = "control"
+  ) %>%
+  ungroup() %>%
+  mutate(
+    # Choose which p-value to use for significance
+    p_for_sig = if (use_adjusted) p.adj else p,
+    Significance = case_when(
+      p_for_sig <= 0.001 ~ "***",
+      p_for_sig <= 0.01  ~ "**",
+      p_for_sig <= 0.05  ~ "*",
+      TRUE ~ "ns"
+    )
+  ) %>%
+  filter(group1 == "control")
+
+# --- Correct merge: match group2 to Treatment ---
+final_table <- stat_results %>%
+  left_join(df_stats, 
+            by = c("Disease", "Feature", "group2" = "Treatment")) %>%
+  select(
+    Disease, Feature, group1, group2,
+    Mean, SD, N, p, p.adj, Significance
+  ) %>%
+  arrange(Disease, Feature, group2)
+
+# --- Export ---
+write.csv(final_table, "FeatureStats_vsControl.csv", row.names = FALSE)
+
+# Preview result
+head(final_table)
+
 ```
+## arrange result into table
+
+````{r}
+library(flextable)
+library(officer)
+library(webshot2)
+
+library(dplyr)
+library(tidyr)
+library(flextable)
+library(officer)
+
+# Set this flag: TRUE = show p-adj, FALSE = show only raw p
+show_adj <- FALSE
+
+table_wide <- final_table %>%
+  filter(grepl("MeanIntensity", Feature)) %>%
+  select(Disease, Feature, group2, Mean, SD, p, p.adj, Significance) %>%
+  mutate(
+    Summary = if (show_adj) {
+      paste0(
+        "mean = ", round(Mean, 3), ", SD = ", round(SD, 3), "\n",
+        "p = ", ifelse(is.na(p), "-", round(p, 3)),
+        ", p-adj = ", ifelse(is.na(p.adj), "-", round(p.adj, 3)),
+        ifelse(!is.na(Significance), paste0(", ", Significance), "")
+      )
+    } else {
+      paste0(
+        "mean = ", round(Mean, 3), ", SD = ", round(SD, 3), "\n",
+        "p = ", ifelse(is.na(p), "-", round(p, 3)),
+        ifelse(!is.na(Significance), paste0(", ", Significance), "")
+      )
+    }
+  ) %>%
+  select(Disease, Feature, group2, Summary) %>%
+  pivot_wider(
+    names_from = group2,
+    values_from = Summary
+  ) %>%
+  arrange(factor(Disease, levels = c("Healthy", "OA", "RA")), Feature)
+
+# --- 2. Create the flextable ---
+ft <- flextable(table_wide) %>%
+  set_header_labels(
+    Feature = "Features",
+    IFN = "IFN",
+    IL1 = "IL1",
+    LPS = "LPS",
+    PIC = "PIC",
+    TNF = "TNF"
+  ) %>%
+  add_header_row(
+    values = c(" ", "Treatment (mean, SD, p, p-adj, significance)"),
+    colwidths = c(1, ncol(table_wide) - 1)
+  ) %>%
+  merge_v(j = c("Disease", "Feature")) %>%  # Merge same disease & same feature rows
+  bold(i = ~!is.na(Disease), j = "Disease") %>%
+  theme_vanilla() %>%
+  autofit() %>%
+  align(align = "center", part = "header") %>%
+  align(j = c("Disease","Feature"), align = "left", part = "body") %>%
+  align(j = c("IFN","IL1","LPS","PIC","TNF"), align = "center", part = "body") %>%
+  line_spacing(space = 1.2, part = "all") %>%
+  set_table_properties(width = 1, layout = "autofit")
+
+# --- 3. Export to Word ---
+doc <- read_docx()
+doc <- body_add_flextable(doc, value = ft)
+print(doc, target = "MeanIntensity_table_merged.docx")
+
+
+# --- 4. Save as image (two-line layout) ---
+save_as_image(ft, path = "MeanIntensity_table_merged.png", zoom = 2)
+
+````
 ## plot differences from control
 
 ````{r}
 
 # Combine both plates and compute difference from control per patient
 # (Assuming control treatment is named "Control" — change if needed)
-control_label <- "control"
 
-df_diff <- df_summary %>%
+control_label <- "control"
+#excluded_patient <- "TRA27"
+
+# if no exclude applied
+df_summary_filtered <- df_summary
+
+# df_summary_filtered <- df_summary %>%
+#   filter(Patient != excluded_patient)
+
+
+df_diff <- df_summary_filtered %>%
   group_by(Patient, Disease, Feature) %>%
   mutate(
     ControlValue = mean(MeanIntensity[Treatment == control_label], na.rm = TRUE),
@@ -217,29 +1294,47 @@ df_diff <- df_summary %>%
   filter(Treatment != control_label) %>%
   ungroup()
 
+# --- Import significance info (from previous step) ---
+# If you already have it in memory:
+# final_table <- read_csv("FeatureStats_vsControl.csv") # optional
 
+sig_table <- final_table %>%
+  filter(Significance %in% c("*", "**", "***")) %>%
+  select(Disease, Feature, group2, Significance) %>%
+  rename(Treatment = group2)
 
-# Loop through each feature
+# --- Loop through features ---
 features <- unique(df_diff$Feature)
+
+out_dir <- "feature_plots"
+dir.create(out_dir, showWarnings = FALSE)
 
 for (f in features) {
   df_plot <- df_diff %>% filter(Feature == f)
-  
+  sig_info <- sig_table %>% filter(Feature == f)
+
+  y_pos <- df_plot %>%
+    group_by(Disease, Treatment) %>%
+    summarise(max_y = max(DiffFromControl, na.rm = TRUE), .groups = "drop") %>%
+    left_join(sig_info, by = c("Disease", "Treatment")) %>%
+    mutate(y_pos = max_y + 0.2) %>%
+    filter(!is.na(Significance))
+
   p <- ggplot(df_plot, aes(x = Treatment, y = DiffFromControl, fill = Treatment)) +
     stat_summary(fun = mean, geom = "bar", color = "black", alpha = 0.4, width = 0.6) +
     stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.3, color = "black") +
-    geom_point(aes(shape = Plate, color = Treatment),
+    geom_point(aes(color = Treatment),
                position = position_jitter(width = 0.1),
                size = 3.5, stroke = 1, alpha = 0.9) +
-    geom_text_repel(
-    aes(label = Patient, color = Treatment),
-    size = 3.5,
-    position = position_jitter(width = 0.15),
-    show.legend = FALSE
-  ) +
-    facet_wrap(~ Disease, scales = "fixed") +
     geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
-    theme_bw(base_size = 14) +
+    facet_wrap(~ Disease, scales = "fixed") +
+    coord_cartesian(ylim = c(-1.5, 2)) +
+    geom_text(
+      data = y_pos,
+      aes(x = Treatment, y = y_pos, label = Significance),
+      color = "black", size = 8, fontface = "bold", vjust = 0
+    ) +
+    theme_bw(base_size = 20) +
     labs(
       title = paste("Relative feature intensity compared to control -", f),
       y = "Difference from control (z-scored intensity)",
@@ -251,9 +1346,12 @@ for (f in features) {
       axis.text.x = element_text(angle = 45, hjust = 1),
       legend.position = "right"
     )
-  
-  print(p)
 
+  ggsave(
+    filename = file.path(out_dir, paste0("Feature_", f, ".png")),
+    plot = p,
+    width = 8, height = 6, dpi = 300
+  )
 }
 
 
@@ -395,10 +1493,50 @@ ggplot(df_percent, aes(x = Treatment, y = PercentPositive, fill = Treatment)) +
     legend.position = "right"
   )
 
+# plot correlation with between (+) and (-) lipid 
+df_filtered <- df %>%
+  filter(Treatment %in% c("control", "IL1"),
+         Disease %in% c("Healthy", "OA", "RA")) %>%
+  mutate(LipidStatus = ifelse(Positive, "Positive", "Negative"))
+
+# Summarize per patient
+df_summary <- df_filtered %>%
+  group_by(Patient, Treatment, Disease, LipidStatus) %>%
+  summarise(MeanMito = mean(Intensity_MeanIntensity_CorrMitosox, na.rm = TRUE), 
+            .groups = "drop")
+
+
+ggplot(df_summary, aes(x = LipidStatus, y = MeanMito, color = LipidStatus)) +
+  geom_boxplot(alpha = 0.3, outlier.shape = NA) +
+  geom_point(position = position_jitter(width = 0.2), size = 3) +
+  facet_grid(Disease ~ Treatment, scales = "free_y") +
+  scale_color_manual(values = c("Positive" = "#fc8d59", "Negative" = "#91bfdb")) +
+  stat_compare_means(
+    aes(group = LipidStatus),
+    method = "wilcox.test",
+    label = "p.signif",
+    size = 6,
+    label.y = NULL,           # use label.y.npc instead
+    label.y.npc = 0.5          # 0 = bottom, 0.5 = middle, 1 = top
+  ) +
+  theme_bw(base_size = 14) +
+  labs(
+    title = "MitoSOX Intensity by Lipid Positivity",
+    x = "Lipid Status",
+    y = "Mean MitoSOX Intensity per Patient"
+  ) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    legend.position = "none"
+  )
+
+
 ```
 #EdU
 
 ```{r}
+# df from previous step
+
 #plot histogram
 ggplot(df, aes(x = Intensity_MeanIntensity_CorrEdU)) +
   geom_histogram(
@@ -408,24 +1546,28 @@ ggplot(df, aes(x = Intensity_MeanIntensity_CorrEdU)) +
     alpha = 0.6
   ) +
   geom_vline(
-    xintercept = 0.1, 
+    xintercept = 0.5, 
     color = "red", 
     linetype = "dashed", 
     linewidth = 1
   ) +
   theme_bw(base_size = 14) +
   labs(
-    title = "Histogram of CorrEdU Integrated Intensity",
-    x = "Intensity_IntegratedIntensity_CorrEdU (a.u.)",
+    title = "Histogram of Intensity_MeanIntensity_CorrEdU",
+    x = "Intensity_MeanIntensity_CorrEdU (a.u.)",
     y = "Cell count"
   )
 
-#compute percentage
-cutoff <- 0.1
+# filter for control
+df_control <- df %>% 
+  filter(Treatment == "control")
 
-df_summary <- df %>%
-  mutate(Pos = Intensity_MeanIntensity_CorrEdU > cutoff) %>%  # mark positive cells
-  group_by(Plate, Disease, Treatment) %>%                      # adjust grouping as you need
+# Compute % positive per patient
+cutoff <- 0.5
+
+df_patient <- df_control %>%
+  mutate(Pos = Intensity_MeanIntensity_CorrEdU > cutoff) %>%
+  group_by(Patient, Disease) %>%
   summarise(
     Total = n(),
     Positive = sum(Pos),
@@ -433,21 +1575,59 @@ df_summary <- df %>%
     .groups = "drop"
   )
 
-print(df_summary)
-
-#plot bar
-ggplot(df_summary, aes(x = Disease, y = Percent_Positive, fill = Disease)) +
-  geom_bar(stat = "identity", color = "black", width = 0.6) +
-  geom_text(aes(label = sprintf("%.1f%%", Percent_Positive)),
-            vjust = -0.5, size = 4) +
-  facet_wrap(~ Treatment) +  
-  theme_bw(base_size = 14) +
-  labs(
-    title = "Percentage of CorrEdU+ Cells (x > 0.1)",
-    x = "Disease",
-    y = "Percent Positive Cells (%)"
+# Compute disease-level mean (for the bar)
+df_avg <- df_patient %>%
+  group_by(Disease) %>%
+  summarise(
+    Mean_Percent = mean(Percent_Positive),
+    SD_Percent   = sd(Percent_Positive),
+    .groups = "drop"
   )
 
+# Plot: bar = mean, dots = each patient
+# Create plot
+p <- ggplot() +
+  
+  # colored bars for mean
+  geom_col(data = df_avg,
+           aes(x = Disease, y = Mean_Percent, fill = Disease),
+           color = "black", width = 0.65) +
+  
+  # jittered dots = patient-level values
+  geom_jitter(data = df_patient,
+              aes(x = Disease, y = Percent_Positive),
+              width = 0.15, size = 3, alpha = 0.8) +
+  
+  # significance test
+  stat_compare_means(
+    data = df_patient,
+    aes(x = Disease, y = Percent_Positive),
+    method = "wilcox.test",
+    ref.group = "Healthy",
+    label = "p.signif",
+    label.y = max(df_patient$Percent_Positive) * 1.12
+  ) +
+  
+  scale_fill_brewer(palette = "Set2") +
+  
+  theme_bw(base_size = 18) +
+  labs(
+    title = paste0("Percentage of CorrEdU+ Cells (x > ", cutoff, ")"),
+    x = "Disease",
+    y = "Percent Positive Cells (%)",
+    fill = "Disease"
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "none"
+  )
+
+print(p)
+
+
+# save plot
+ggsave("CorrEdU_percent_positive_control_only_Set2.png",
+       plot = p, width = 6, height = 5, dpi = 300)
 
 ```
 ## Fit Single Model
@@ -1212,57 +2392,143 @@ ggplot(aucs %>%
   scale_y_continuous(limits = c(0.5, 1.0), breaks = seq(0.5, 1.0, by = 0.1))
 
 ````
-#compare healthy, RA, OA
+# Pre-validation analysis
+Predict Disease
 
-````{r}
-#all features
+```{r}
+# define new target
+target = "Disease"
 
-sce_cont <- sce[, sce$Treatment == "control"]
- 
-result <- fitModel(sce_cont,
-                   target = "Disease", 
-                   interest_level = "RA", reference_level = "OA", 
-                   group = "Patient", strata = "Disease",
-                   n_folds = 20, n_threads = 8)
+# set Healthy as reference level
+sce_aggr$Disease <- as.factor(sce_aggr$Disease)
+sce_aggr$Disease <- relevel(sce_aggr$Disease, ref = "OA") #Healthy
 
+# filter to control cells only and plate
+sce_aggr <- sce_aggr[, sce_aggr$Treatment == "control"]
 
-plotROC(result)
+# comparison
+reference_level <- "OA"
+interest_levels <- setdiff(levels(sce_aggr$Disease), reference_level)
 
-#for selected features
+# same across panels
+types <- c("AreaShape", "Intensity", "Texture", "RadialDistribution", 
+           "Granularity")
 
-sce_select <- sce[str_detect(names(sce), "Texture|Intensity|AreaShape"), ]
-sce_cont <- sce_select[, sce_select$Treatment == "control"]
-
-result <- fitModel(sce_cont,
-                   target = "Disease", 
-                   interest_level = "OA", reference_level = "Healthy", 
-                   group = "Patient", strata = "Disease",
-                   n_folds = 20, n_threads = 8)
+# channels vary across panels
+channels <- c("CorrLipid", "CorrBlue", "CorrMitosox", "CorrEdU")
 
 
-plotROC(result)
+# only run for "all" feature
+sce_oa <- predictLOO(
+  sce_aggr, 
+  target = target,
+  interest_level = "RA", reference_level = "OA",
+  types = NULL, channels = NULL,
+  n_threads = n_threads
+  )
 
-##only one function at a time
+#n_tests <- length(types)+length(channels)
+meta_vars = c("Patient", "Disease", "Plate")
+plotLOO(sce_oa, meta_vars = meta_vars, target = target)
+plotROC(sce_oa, meta_vars = meta_vars, target = target)
+plotAUC(sce_oa, meta_vars = meta_vars, target = target)  #, batch = "Plate"
+volcanoPlot(sce_oa, p_cutoff = 0.05/n_tests, fc_cutoff = 0.5,
+            meta_vars = meta_vars, target = target)
 
-sce_select <- sce[str_detect(names(sce), "Texture|Intensity|AreaShape"), ]
+# compare RA vs Healthy
+sce_ra <- predictLOO(
+  sce_aggr, 
+  target = target,
+  interest_level = "RA", reference_level = "Healthy",
+  types = NULL, channels = NULL,
+  n_threads = n_threads
+  )
+plotLOO(sce_ra, meta_vars = meta_vars, target = target, )
+plotROC(sce_ra, meta_vars = meta_vars, target = target)
+plotAUC(sce_ra, meta_vars = meta_vars, target = target)
+volcanoPlot(sce_ra, p_cutoff = 0.05/n_tests, fc_cutoff = 0.5, 
+            meta_vars = meta_vars, target = target)
 
-sce_select <- sce_select[
-  str_detect(rownames(sce_select), "CorrEdU"),  #CorrMitosox, CorrEdU,CorrLipid
-  ]  
-sce_cont <- sce_select[, sce_select$Treatment == "control"]
-
-rownames(sce_select)
-
-result <- fitModel(sce_cont,
-                   target = "Disease", 
-                   interest_level = "OA", reference_level = "Healthy", 
-                   group = "Patient", strata = "Disease",
-                   n_folds = 10, n_threads = 8)
+# combine OA and RA
+plotAUC(list(sce_oa, sce_ra), meta_vars = meta_vars, target = target)
+volcanoPlot(list(sce_oa, sce_ra), 
+            p_cutoff = 0.1/(2*n_tests), 
+            fc_cutoff = 0.5, 
+            meta_vars = meta_vars, target = target)
 
 
-plotROC(result)
+```
+
+# To save plots
+
+```{r}
+# Create folder to keep files tidy
+dir.create("Publication_Plots LOO", showWarnings = FALSE)
+
+meta_vars <- c("Patient", "Disease", "Plate")
+target <- "Disease"
+
+# OA vs Healthy
+p_loo_oa <- plotLOO(sce_oa, meta_vars = meta_vars, target = target)
+p_roc_oa <- plotROC(sce_oa, meta_vars = meta_vars, target = target)
+p_auc_oa <- plotAUC(sce_oa, meta_vars = meta_vars, target = target)
+
+# RA vs Healthy
+p_loo_ra <- plotLOO(sce_ra, meta_vars = meta_vars, target = target)
+p_roc_ra <- plotROC(sce_ra, meta_vars = meta_vars, target = target)
+p_auc_ra <- plotAUC(sce_ra, meta_vars = meta_vars, target = target)
+
+theme_pub <- theme_bw(base_size = 18) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    panel.grid = element_blank()
+  )
+
+p_auc_oa <- p_auc_oa + theme_pub
+p_auc_ra <- p_auc_ra + theme_pub
+p_roc_oa <- p_roc_oa + theme_pub
+p_roc_ra <- p_roc_ra + theme_pub
+p_loo_oa <- p_loo_oa + theme_pub
+p_loo_ra <- p_loo_ra + theme_pub
 
 
+
+# Optional high-res PNGs for slides
+ggsave("Publication_Plots LOO/LOO_OA_vs_Healthy.png", p_loo_oa, width = 8, height = 6)
+ggsave("Publication_Plots/ROC_OA_vs_Healthy.png", p_roc_oa, width = 8, height = 6)
+ggsave("Publication_Plots/AUC_OA_vs_Healthy.png", p_auc_oa, width = 8, height = 6)
+
+# --- RA plots ---
+ggsave("Publication_Plots/LOO_RA_vs_Healthy.png", p_loo_ra, width = 8, height = 6)
+ggsave("Publication_Plots/ROC_RA_vs_Healthy.png", p_roc_ra, width = 8, height = 6)
+ggsave("Publication_Plots/AUC_RA_vs_Healthy.png", p_auc_ra, width = 8, height = 6)
+
+p_auc_combined <- plotAUC(
+  list(sce_oa, sce_ra),
+  meta_vars = meta_vars,
+  target = target
+) +
+  theme_bw(base_size = 20) +    # ✅ increase font size
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 22),
+    axis.title = element_text(face = "bold", size = 18),
+    axis.text = element_text(size = 14),
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text = element_text(size = 14)
+  )
+
+# --- Save publication-quality figure ---
+dir.create("Publication_Plots", showWarnings = FALSE)
+
+ggsave(
+  filename = "Publication_Plots/AUC_Combined_OA_RA_vs_Healthy.tiff",
+  plot = p_auc_combined,
+  width = 8,
+  height = 6,
+  dpi = 600,   # ✅ high resolution
+  units = "in"
+)
 
 ````
 #compare joint differences

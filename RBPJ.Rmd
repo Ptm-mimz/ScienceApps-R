@@ -1,0 +1,478 @@
+---
+title: "Pre-Validation Analysis for CellProfiler"
+author: "Christof Seiler"
+date: now
+format: html
+editor: source
+embed-resources: true
+---
+
+## Load Data
+
+Load our package.
+
+```{r load_pkgs, message=FALSE}
+library(cellpaintr)
+library(ggplot2)
+library(scater)
+library(scran)
+library(bluster)
+library(stringr)
+library(dplyr)
+library(batchelor)
+library(BiocParallel)
+library(tidyr)
+library(MultiAssayExperiment)
+library(lme4)
+library(lmerTest)
+n_threads <- 16
+
+```
+
+Load `CellProfiler` output and create a `SingleCellExperiment` object.
+
+```{r}
+# path to files
+# file_standard <- paste0("/shares/rheumatologie.usz/mim/250410 Cellpainting_RBPJ/MyExpt_Cells.csv")
+# file_metabolism <- paste0("/shares/rheumatologie.usz/mim/250410 metabolism_RBPJ/MyExpt_Cells.csv")
+# file_stress <- paste0("/shares/rheumatologie.usz/mim/250410 stress panel_RBPJ/MyExpt_Cells.csv")
+
+# for CRISPR experiment
+file_standard <- paste0("/shares/rheumatologie.usz/mim/250925 - RBPJ KO_Cellpainting/MyExpt_Cells.csv")
+file_metabolism <- paste0("/shares/rheumatologie.usz/Ege/25092025 - RBPJ KO/metabolism/output/MyExpt_Cells.csv")
+file_stress <- paste0("/shares/rheumatologie.usz/Ege/25092025 - RBPJ KO/stress/output/MyExpt_Cells.csv")
+
+# load each plate into a separate bioconductor object
+sce_standard <- loadData(file_standard)
+sce_standard$Panel <- "standard"
+sce_metabolism <- loadData(file_metabolism)
+sce_metabolism$Panel <- "metabolism"
+sce_stress <- loadData(file_stress)
+sce_stress$Panel <- "stress"
+
+# merge se objects on common features
+sce_list <- list(standard = sce_standard, 
+                 metabolism = sce_metabolism, 
+                 stress = sce_stress)
+
+```
+
+## Data Transformation
+
+Prepare the data for machine learning.
+
+```{r}
+data_transformation <- function(sce) {
+
+  # remove cells with missing features
+  sce <- removeNAs(sce)
+    
+  # remove outlier images
+  sce <- removeOutliers(sce, min = 5, max = 300)
+    
+  # remove outlier cells
+  stats <- perCellQCMetrics(sce, assay.type = "features")
+  sce <- sce[, !isOutlier(stats$sum)]
+    
+  # remove features with zero spread
+  sce <- removeLowVariance(sce, robust = TRUE)
+    
+  # remove zero-inflated features
+  sce <- removeZeroInflation(sce)
+    
+  # transform non-negatives features and scale all features
+  sce <- transformLogScale(sce, robust = TRUE)
+  
+  # fix factors
+  sce$Treatment <- as.factor(sce$Treatment)
+  sce$Treatment <- relevel(sce$Treatment, ref = "control")
+  sce$Group <- as.factor(sce$Group)
+  sce$Group <- relevel(sce$Group, ref = "Cas9")
+  sce
+  
+}
+sce_list <- lapply(sce_list, data_transformation)
+lapply(sce_list, plotCellsPerImage)
+
+```
+#Pseudo-bulk per well.
+
+```{r}
+sce_list_aggr <- lapply(sce_list, function(sce) {
+  
+  aggregateAcrossCells(
+    sce,
+    id = colData(sce)[, c("ImageNumber", "Well", "Patient", "Plate")],
+    use.assay.type = "tfmfeatures",
+    statistics = "mean"
+    )
+  
+})
+
+```
+## Unsupervised Analysis
+
+Use `scater` for exploratory data analysis.
+
+```{r}
+# sce_list_aggr <- lapply(sce_list_aggr, runPCA, exprs_values = "tfmfeatures")
+# lapply(sce_list_aggr, plotReducedDim, dimred = "PCA", colour_by = "Group")
+
+
+sce_list <- lapply(sce_list, runPCA, exprs_values = "tfmfeatures")
+lapply(sce_list, plotReducedDim, dimred = "PCA", colour_by = "Treatment")
+
+```
+
+What is driving PC1?
+
+```{r}
+# lapply(sce_list_aggr, plotPCACor, filter_by = 1, top = 20)
+
+lapply(sce_list, plotPCACor, filter_by = 1, top = 20)
+
+```
+Check batch effect for just one feature.
+
+```{r}
+tb_sce <- makePerCellDF(sce_list$stress, 
+                        assay.type = "tfmfeatures",
+                        features = "Texture_Entropy_CorrTMRM_10_02_256"
+                        )
+tb_sce |> 
+  ggplot(aes(Texture_Entropy_CorrTMRM_10_02_256, 
+             group = Patient, color = Plate)) + 
+  geom_density() + 
+  facet_grid(Treatment ~ Disease)
+
+```
+
+Remove features.
+
+```{r}
+# feature_ids <- which(
+#   rownames(sce_list_aggr$standard) %in% c("Correlation_Costes_CorrMito_CorrBlue")
+#   )
+# sce_list_aggr$standard <- sce_list_aggr$standard[-feature_ids, ]
+
+
+# standard
+feature_ids <- which(
+  rownames(sce_list_aggr$standard) %in% c("Correlation_Manders_CorrCyto_CorrSYTO", "Correlation_Costes_CorrCyto_CorrBlue","Correlation_Costes_CorrMito_CorrBlue","Correlation_Costes_CorrER_CorrBlue","Correlation_Costes_CorrSYTO_CorrBlue","Correlation_Costes_CorrMito_CorrSYTO","Correlation_Costes_CorrMito_CorrER", "Correlation_Manders_CorrER_CorrMito")
+  )
+sce_list_aggr$standard <- sce_list_aggr$standard[-feature_ids, ]
+
+
+# metabolism
+feature_ids <- which(
+  rownames(sce_list$metabolism) %in% c("Correlation_Costes_CorrMitosox_CorrBlue", "Correlation_Costes_CorrLipid_CorrBlue")
+  )
+sce_list$metabolism <- sce_list$metabolism[-feature_ids, ]
+
+
+# stress
+
+patterns <- c(
+  "^Texture_SumEntropy_CorrTMRM_5",
+  "^Texture_SumEntropy_CorrTMRM_3",
+  "^Texture_Entropy_CorrTMRM_5",
+  "^Texture_Entropy_CorrTMRM_3"
+)
+
+# Create one combined regex
+pattern_regex <- paste(patterns, collapse = "|")
+
+# Identify features to remove
+feature_ids <- grep(pattern_regex, rownames(sce_list$stress))
+
+# Remove them
+sce_list$stress <- sce_list$stress[-feature_ids, ]
+
+
+# feature_ids <- which(
+#   rownames(sce_list$stress) %in% c("Texture_SumEntropy_CorrTMRM_5_03_256", "Texture_SumEntropy_CorrTMRM_5_02_256")
+#   )
+# sce_list$stress <- sce_list$stress[-feature_ids, ]
+
+```
+
+```{r}
+
+```
+
+## Pre-Validation Analysis
+
+Standard panel.
+
+```{r}
+# filter to controls only
+standard <- sce_list_aggr$standard
+standard <- standard[, standard$Treatment == "control"]
+
+# comparison
+reference_level <- "Cas9"      #Cas9 cont
+interest_level <- "KO"         #KO RBPJ
+
+# same across panels
+types <- c("AreaShape", "Intensity", "Texture", "RadialDistribution", 
+           "Granularity")
+
+# channels vary across panels
+channels <- c("CorrCyto", "CorrER", "CorrMito", "CorrSYTO", "CorrBlue")
+
+standard <- predictLOO(
+  standard, target = "Group",  #Group
+  interest_level = interest_level, reference_level = reference_level,
+  types = NULL, channels = channels,
+  weights = "ncells", n_threads = n_threads
+  )
+
+#plotLOO(standard, meta_vars = c("Patient", "Group"), target = "Group")  #cas9 data change Group-> Group
+
+plotLOO(standard, meta_vars = c("Patient", "Group"), target = "Group") + geom_line(aes(group = Patient), color = "darkgray")
+
+plotROC(standard, meta_vars = c("Patient", "Group"), target = "Group")
+plotAUC(standard, meta_vars = c("Patient", "Group"), target = "Group")
+volcanoPlot(standard, 
+            meta_vars = c("Patient", "Group"),
+            target = "Group")
+
+p_loo <- plotLOO(standard, meta_vars = c("Patient", "Group"), target = "Group")+ geom_line(aes(group = Patient), color = "darkgray")
+p_roc <- plotROC(standard, meta_vars = c("Patient", "Group"), target = "Group")
+p_auc <- plotAUC(standard, meta_vars = c("Patient", "Group"), target = "Group")
+p_volcano <- volcanoPlot(
+    standard,
+    meta_vars = c("Patient", "Group"),
+    target = "Group"
+)
+
+save_pub <- function(plot, filename, width = 6, height = 5) {
+    ggsave(paste0(filename, ".png"), plot = plot, width = width, height = height, dpi = 300)
+}
+save_pub(p_loo, "LOO_plot_standard")
+save_pub(p_roc, "ROC_plot_standard")
+save_pub(p_auc, "AUC_plot_standard")
+save_pub(p_volcano, "Volcano_plot_standard")
+
+```
+
+Metabolism panel.
+
+```{r}
+# filter to controls only
+metabolism <- sce_list_aggr$metabolism
+metabolism <- metabolism[, metabolism$Treatment == "control"]
+
+# channels vary across panels
+channels <- c("CorrBlue", "CorrLipid", "CorrEdU", "CorrMitosox")
+
+metabolism <- predictLOO(
+  metabolism, target = "Group",
+  interest_level = interest_level, reference_level = reference_level,
+  types = NULL, channels = channels,
+  weights = "ncells", n_threads = n_threads
+  )
+
+plotLOO(metabolism, meta_vars = c("Patient", "Group"), target = "Group")
+plotROC(metabolism, meta_vars = c("Patient", "Group"), target = "Group")
+plotAUC(metabolism, meta_vars = c("Patient", "Group"), target = "Group")
+volcanoPlot(metabolism, 
+            meta_vars = c("Patient", "Group"),
+            target = "Group")
+
+p_loo <- plotLOO(metabolism, meta_vars = c("Patient", "Group"), target = "Group")+ geom_line(aes(group = Patient), color = "darkgray")
+p_roc <- plotROC(metabolism, meta_vars = c("Patient", "Group"), target = "Group")
+p_auc <- plotAUC(metabolism, meta_vars = c("Patient", "Group"), target = "Group")
+p_volcano <- volcanoPlot(
+    metabolism,
+    meta_vars = c("Patient", "Group"),
+    target = "Group"
+)
+
+save_pub <- function(plot, filename, width = 6, height = 5) {
+    ggsave(paste0(filename, ".png"), plot = plot, width = width, height = height, dpi = 300)
+}
+save_pub(p_loo, "LOO_plot_metabolism")
+save_pub(p_roc, "ROC_plot_metabolism")
+save_pub(p_auc, "AUC_plot_metabolism")
+save_pub(p_volcano, "Volcano_plot_metabolism")
+
+```
+
+Stress panel.
+
+```{r}
+# filter to controls only
+stress <- sce_list_aggr$stress
+stress <- stress[, stress$Treatment == "control"]
+
+# channels vary across panels
+channels <- c("CorrCytoID", "CorrBlue", "CorrTMRM", "CorrLyso")
+
+stress <- predictLOO(
+  stress, target = "Group",
+  interest_level = interest_level, reference_level = reference_level,
+  types = NULL, channels = channels,
+  weights = "ncells", n_threads = n_threads
+  )
+
+plotLOO(stress, meta_vars = c("Patient", "Group"), target = "Group")
+plotROC(stress, meta_vars = c("Patient", "Group"), target = "Group")
+plotAUC(stress, meta_vars = c("Patient", "Group"), target = "Group")
+volcanoPlot(stress, 
+            meta_vars = c("Patient", "Group", "Panel"),
+            target = "Group")
+
+p_loo <- plotLOO(stress, meta_vars = c("Patient", "Group"), target = "Group")+ geom_line(aes(group = Patient), color = "darkgray")
+p_roc <- plotROC(stress, meta_vars = c("Patient", "Group"), target = "Group")
+p_auc <- plotAUC(stress, meta_vars = c("Patient", "Group"), target = "Group")
+p_volcano <- volcanoPlot(
+    stress,
+    meta_vars = c("Patient", "Group"),
+    target = "Group"
+)
+
+save_pub <- function(plot, filename, width = 6, height = 5) {
+    ggsave(paste0(filename, ".png"), plot = plot, width = width, height = height, dpi = 300)
+}
+save_pub(p_loo, "LOO_plot_stress")
+save_pub(p_roc, "ROC_plot_stress")
+save_pub(p_auc, "AUC_plot_stress")
+save_pub(p_volcano, "Volcano_plot_stress")
+
+```
+
+Combine volcano plot.
+
+```{r}
+named_list <- list(standard = standard, 
+                   metabolism = metabolism, 
+                   stress = stress)
+p <- volcanoPlot(
+  named_list,
+  meta_vars = c("Patient", "Group"),
+  target = "Group", 
+  p_cutoff = 0.1, 
+  fc_cutoff = 0.25
+)
+
+ggsave("volcano_plot.png", plot = p, width = 8, height = 6)
+
+```
+
+Calculate effect sizes (log-odds) and p-values (paired ranked test).
+
+```{r}
+stats <- calculateStats(sce_list)
+
+stats$Panel <- factor(stats$Panel, c("standard", "metabolism", "stress"))
+volcanoPlot(stats, facet = "Target", color = "Panel")
+```
+
+## Reproducibilty
+
+```{r}
+sessionInfo()
+```
+# EdU
+
+```{r}
+sce_met <- sce_list$metabolism
+intensity_data <- as.data.frame(t(assay(sce_met, "tfmfeatures"))) 
+metadata <- as.data.frame(colData(sce_met)[, c("Plate", "Well", "Patient", "Treatment", "Group")])
+
+# Combine
+df <- cbind(metadata, intensity_data)
+
+#plot histogram
+ggplot(df, aes(x = Intensity_MeanIntensity_CorrEdU)) +
+  geom_histogram(
+    bins = 50,
+    fill = "steelblue",
+    color = "black",
+    alpha = 0.6
+  ) +
+  geom_vline(
+    xintercept = 4, 
+    color = "red", 
+    linetype = "dashed", 
+    linewidth = 1
+  ) +
+  theme_bw(base_size = 14) +
+  labs(
+    title = "Histogram of Intensity_MeanIntensity_CorrEdU",
+    x = "Intensity_MeanIntensity_CorrEdU (a.u.)",
+    y = "Cell count"
+  )
+
+# filter for control
+df_control <- df %>% 
+  filter(Treatment == "control")
+
+# Compute % positive per patient
+cutoff <- 4
+
+df_patient <- df %>%
+  mutate(Pos = Intensity_MeanIntensity_CorrEdU > cutoff) %>%
+  group_by(Patient, Group, Treatment) %>%
+  summarise(
+    Total = n(),
+    Positive = sum(Pos),
+    Percent_Positive = (Positive / Total) * 100,
+    .groups = "drop"
+  )
+
+# mean per Group × Treatment
+df_avg <- df_patient %>%
+  group_by(Group, Treatment) %>%
+  summarise(
+    Mean_Percent = mean(Percent_Positive),
+    SD_Percent   = sd(Percent_Positive),
+    .groups = "drop"
+  )
+
+p <- ggplot() +
+  
+  # bars
+  geom_col(data = df_avg,
+           aes(x = Group, y = Mean_Percent, fill = Group),
+           color = "black", width = 0.65) +
+  
+  # dots
+  geom_jitter(data = df_patient,
+              aes(x = Group, y = Percent_Positive),
+              width = 0.15, size = 3, alpha = 0.8) +
+  
+  # significance per facet (auto)
+  stat_compare_means(
+    data = df_patient,
+    aes(x = Group, y = Percent_Positive),
+    method = "wilcox.test",
+    ref.group = "Healthy",
+    label = "p.signif",
+    label.y = max(df_patient$Percent_Positive) * 1.15
+  ) +
+  
+  facet_wrap(~ Treatment) +
+  
+  scale_fill_brewer(palette = "Set2") +
+  
+  theme_bw(base_size = 18) +
+  labs(
+    title = paste0("Percentage of CorrEdU+ Cells (x > ", cutoff, ")"),
+    x = "Group",
+    y = "Percent Positive Cells (%)",
+    fill = "Group"
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "none"
+  )
+
+print(p)
+
+
+
+# save plot
+ggsave("CorrEdU_percent_positive_by groupXtreatment.png",
+       plot = p, width = 6, height = 5, dpi = 300)
