@@ -21,6 +21,11 @@ library(envalysis)
 library(ggpubr)
 library(org.Hs.eg.db) 
 library(readxl)
+library(eulerr)
+library(grid)
+library(ggvenn)
+library(VennDiagram)
+library(pheatmap)
 
 ```
 
@@ -29,20 +34,41 @@ library(readxl)
 Prepare the data for biological terms
 
 ```{r}
-#Load raw file
-    setwd("/data/plapha/Gene expression_healthy RA OA")
+# for TNF stimulation
+  setwd("/data/plapha/TNF DEG-hand_knee/analysis from Ege")
+  TNF_data <- readRDS("tnf_vs_nontnf_non_filtered_patientwise.rds")
+  TNF_data <- readRDS("nrm_counts_be_removed_mean.RDS")
 
-#cytokine_data <- readRDS("ra_de_list_only_expressed_genes.rds")
-#cytokine_data <- readRDS("~/Desktop/PhD/2024 First Term/RNA Sequencing from Tsuchiya et al./ra_de_list_only_expressed_genes.rds")
+# for cytokine stimulation Tsuchiya et al.
+    
+    setwd("/data/plapha/Cytokine stimulation gene Tsuchiya et al")
 
-##for healthy vs RA analysis
-df <- read_excel("/data/plapha/Gene expression_healthy RA OA/results_vs_healthy_vs_ra.xlsx")
+#Load raw file    
+    cytokine_data <- readRDS("ra_de_list_only_expressed_genes.rds")
+    names(cytokine_data)
+    
+# Load autophagy gene from https://autophagy.lu/genes/
+   autophagy <-  read_csv("/data/plapha/Cytokine stimulation gene Tsuchiya et al/autophagy genes/HADB.csv")
 
-#names(cytokine_data)
-names(df)
+   # for autophagy after filter fibroblast expressing gene
+    autophagy  <- readRDS("/data/plapha/Cytokine stimulation gene Tsuchiya et al/autophagy genes/autophagy_gene_sets_filtered.rds")
+   
+   
+# for healthy vs RA analysis
+    setwd("~/data/Gene expression_healthy RA OA")
+
+    df <- read_excel("/home/plapha/data/Gene expression_healthy RA OA/results_vs_healthy_vs_ra.xlsx")
+
+    names(df)
+    
+# load IL1-exclusive gene 
+    il1_genes <- read.csv("/home/plapha/data/Gene expression_healthy RA OA/IL1b_exclusive_genes.csv",
+                      header = TRUE, stringsAsFactors = FALSE)
+    # The gene list may be in first column → extract it
+il1_gene_list <- il1_genes[[1]]
 
 ```
-#Load new gene sets --> only express in Fibroblast (cutoff 100 from expression file)
+#Load new gene sets --> only express in Fibroblast (cutoff from expression file)
 
 ```{r}
 Fib_gene_sets <- readRDS("fib_gene_sets_cut10.rds")
@@ -92,7 +118,12 @@ sapply(coverage_check, function(x) c(present = x$n_present, missing = x$n_missin
 
 #now it looks so much better!
 
+```
+#check coverage
 ##for healthy vs RA analysis
+
+```{r}
+
 deg_genes <- unique(df$gene)
 coverage_check <- lapply(Fib_gene_sets, function(genes) {
   present <- genes %in% deg_genes
@@ -238,20 +269,32 @@ plot_fgsea <- function(fgsea_result, name_of_the_stimulation,if_lfc) {
   }else{
     title = paste0("GSEA Pathways of ",name_of_the_stimulation," (signed pvalue)") 
   }
+  
+  fgsea_result <- fgsea_result %>%
+    mutate(
+      padj_label = formatC(padj, format = "f", digits = 3),
+      hjust_value = ifelse(NES > 0, 1.1, -0.1)  # adjust position depending on NES direction
+    )
+  
   # Create the plot
-  p <- ggplot(fgsea_result, aes(x = reorder(pathway, -NES), y = NES, fill = padj)) +
+  p <- ggplot(fgsea_result, aes(x = reorder(pathway, NES), y = NES, fill = padj)) +
     geom_bar(stat = "identity", alpha = 0.9, width = 0.7) +
-    geom_text(aes(label = round(padj, 2)), hjust = 1.1, size = 5, color = "white")+ 
+    geom_text(aes(label = padj_label, hjust = hjust_value), size = 4, color = "white") +
     scale_fill_gradient(low = "#4575b4", high = "#d73027", limits = c(0, max(fgsea_result$padj))) +
     coord_flip() +
-    labs(title = title,
-         x = "Pathway",
-         y = "Normalized Enrichment Score (NES)",
-         fill = "padj") +
+    labs(
+      title = title,
+      x = "Pathway",
+      y = "Normalized Enrichment Score (NES)",
+      fill = "padj"
+    ) +
     theme_publish(base_size = 14) +
-    theme(plot.title = element_text(size = 16, face = "bold"),
-          legend.position = "bottom", legend.text = element_text(angle = 45))
-
+    theme(
+      plot.title = element_text(size = 16, face = "bold"),
+      legend.position = "bottom",
+      legend.text = element_text(angle = 45)
+    )
+  
   return(p)
 }
 
@@ -504,3 +547,713 @@ for (i in seq_len(min(5, nrow(top_pathways)))) {
 }
 
 ```
+#analyse overlapping gene from cytokine_data to functions in gene_sets --> Venn diagram
+
+```{r}
+#for a specific cytokine:
+IFNg_data <- cytokine_data$IFNg 
+TNFa_data <- cytokine_data$TNFa
+IL1b_data <- cytokine_data$IL1b
+
+# --- Select gene set (just change this line)
+pathway_name <- "Neutral Lipid"   # or "Proliferation",Autophagy,Stress,Lipid Metabolism
+gene_set <- Fib_gene_sets[[pathway_name]]
+
+# --- Filter each cytokine to the chosen gene set
+filter_genes <- function(cytokine_data, gene_set) {
+  tmp <- cytokine_data[cytokine_data$genename %in% gene_set & 
+                         cytokine_data$log2FoldChange > 0 & 
+                         cytokine_data$padj < 0.05, ]
+  return(tmp$genename)
+}
+
+IFNg_genes <- filter_genes(IFNg_data, gene_set)
+TNFa_genes <- filter_genes(TNFa_data, gene_set)
+IL1b_genes <- filter_genes(IL1b_data, gene_set)
+
+# --- Create Venn diagram
+fit <- euler(list(
+  IFNg = IFNg_genes,
+  TNFa = TNFa_genes,
+  IL1b = IL1b_genes
+))
+
+plot(fit,
+     fills = list(fill = c("skyblue", "pink", "lightgreen"), alpha = 0.5),
+     labels = list(font = 4),
+     main = paste("Overlap of upregulated & significant IFNg, TNFa, IL1b genes in", pathway_name, "set"),
+     quantities = TRUE)
+
+
+# --- Find overlap sets
+genes_IFNg_only      <- setdiff(IFNg_genes, union(TNFa_genes, IL1b_genes))
+genes_TNFa_only      <- setdiff(TNFa_genes, union(IFNg_genes, IL1b_genes))
+genes_IL1b_only      <- setdiff(IL1b_genes, union(IFNg_genes, TNFa_genes))
+
+genes_IFNg_TNFa      <- intersect(IFNg_genes, TNFa_genes)
+genes_IFNg_IL1b      <- intersect(IFNg_genes, IL1b_genes)
+genes_TNFa_IL1b      <- intersect(TNFa_genes, IL1b_genes)
+genes_all_three      <- Reduce(intersect, list(IFNg_genes, TNFa_genes, IL1b_genes))
+
+# --- Combine into a wide table
+max_len <- max(length(genes_IFNg_only), length(genes_TNFa_only), length(genes_IL1b_only),
+               length(genes_IFNg_TNFa), length(genes_IFNg_IL1b), length(genes_TNFa_IL1b), 
+               length(genes_all_three))
+
+pad <- function(x) c(x, rep(NA, max_len - length(x)))
+
+venn_table_3 <- data.frame(
+  IFNg_only       = pad(genes_IFNg_only),
+  TNFa_only       = pad(genes_TNFa_only),
+  IL1b_only       = pad(genes_IL1b_only),
+  IFNg_TNFa       = pad(genes_IFNg_TNFa),
+  IFNg_IL1b       = pad(genes_IFNg_IL1b),
+  TNFa_IL1b       = pad(genes_TNFa_IL1b),
+  All_three       = pad(genes_all_three),
+  stringsAsFactors = FALSE
+)
+
+# View table
+head(venn_table_3)
+
+# --- Export to CSV (name automatically adjusted by set)
+outfile <- paste0("IFNg_TNFa_IL1b_Venn_", pathway_name, ".csv")
+write.csv(venn_table_3, outfile, row.names = FALSE)
+
+
+```
+#Cytokine up reg gene VS all Fib gene in each pathways -> Venn
+
+```{r}
+
+# extract cytokine data like above
+
+#----1.Select TNFa upregulated genes
+TNFa_up <- TNFa_data %>%
+     filter(log2FoldChange > 0, padj < 0.05) %>%
+     pull(genename)
+
+# ---- 2. Select fibroblast proliferation genes ----
+Fib_prolif <- Fib_gene_sets$Proliferation
+
+# ---- 3. Create Venn input ----
+venn_list <- list(
+  TNFa_upregulated = TNFa_up,
+  Fibroblast_Proliferation = Fib_prolif
+)
+
+# ---- 4. Plot Venn diagram ----
+venn.plot <- venn.diagram(
+  x = list(
+    TNFa_upregulated = TNFa_up,
+    Fibroblast_Proliferation = Fib_prolif
+  ),
+  filename = NULL,
+  fill = c("lightpink1", "#56B4E9"),
+  alpha = 0.5,
+  cex = 1.5,               # size of numbers inside circles
+  cat.cex = 1.5,           # size of category labels
+  scaled = TRUE,
+  cat.fontfamily = "Helvetica", # font for category labels
+  cat.fontface = "bold",    # style for category labels
+  fontfamily = "Helvetica",     # font for numbers inside circles
+  fontface = "plain",
+  cat.pos = c(0, 180),    # angle position of the labels
+  cat.dist = c(0.05, 0.05) # distance from the circles; increase if labels are long
+# style for numbers inside circles
+)
+
+grid::grid.newpage()      
+grid::grid.draw(venn.plot)
+
+```
+# Autophagy analysis from HADB.csv file -> volcano plot
+
+```{r}
+
+### --- Choose cytokine here ---
+selected_cytokine <- "IL1b"   # <-- change to "IL1b" or TNFa IFNg
+
+### --- Extract selected dataset ---
+df <- cytokine_data[[selected_cytokine]]
+
+### --- Make sure gene column names match ---
+# autophagy_genes$GENE  should match df$genename
+df$genename <- toupper(df$genename)
+autophagy$GENE <- toupper(autophagy$GENE)
+
+### --- Identify autophagy genes present in cytokine-stimulated dataset ---
+autophagy_hits <- df[df$genename %in% autophagy$GENE, ]
+
+### --- Optional: only significantly changed genes ---
+sig_cutoff <- 0.05
+autophagy_hits_sig <- autophagy_hits[autophagy_hits$padj < sig_cutoff, ]
+
+### --- Enrichment test (Fisher exact test) ---
+background_genes <- df$genename
+auto_set <- autophagy$GENE
+
+# Build contingency table
+in_auto <- background_genes %in% auto_set
+is_sig <- df$padj < sig_cutoff
+
+tbl <- table(Autophagy = in_auto, Significant = is_sig)
+
+fisher_result <- fisher.test(tbl)
+
+### --- Print results ---
+cat("Cytokine selected:", selected_cytokine, "\n\n")
+
+cat("Number of autophagy genes in dataset =", nrow(autophagy_hits), "\n")
+cat("Significant autophagy genes =", nrow(autophagy_hits_sig), "\n\n")
+
+cat("Fisher enrichment p-value =", fisher_result$p.value, "\n")
+cat("Odds ratio =", fisher_result$estimate, "\n\n")
+
+### --- View genes ---
+autophagy_hits_sig[order(autophagy_hits_sig$log2FoldChange, decreasing = TRUE), ]
+
+#-------------------------
+# volcano plot
+library(ggrepel)
+
+# Prepare Autophagy column
+df$Autophagy <- ifelse(df$genename %in% auto_set, "Autophagy", "Other")
+
+# Filter significant autophagy genes to label
+label_genes <- df %>%
+    filter(Autophagy == "Autophagy", padj < 0.05)
+
+# Separate datasets for plotting order
+df_other <- df %>% filter(Autophagy == "Other")
+df_auto  <- df %>% filter(Autophagy == "Autophagy")
+
+# -----------------------
+# Fisher enrichment test (same as before)
+background_genes <- df$genename
+sig_cutoff <- 0.05
+in_auto <- df$genename %in% auto_set
+is_sig  <- df$padj < sig_cutoff
+tbl <- table(Autophagy = in_auto, Significant = is_sig)
+fisher_result <- fisher.test(tbl)
+fisher_label <- paste0("Fisher enrichment p = ", signif(fisher_result$p.value,3),
+                       ", OR = ", round(fisher_result$estimate,2))
+
+# -----------------------
+# Volcano plot
+ggplot() +
+  # Other genes (gray)
+  geom_point(data = df_other,
+             aes(x = log2FoldChange, y = -log10(padj), color = Autophagy, shape = Autophagy, size = Autophagy),
+             alpha = 0.6, show.legend = TRUE) +
+  # Autophagy genes (red, on top)
+  geom_point(data = df_auto,
+             aes(x = log2FoldChange, y = -log10(padj), color = Autophagy, shape = Autophagy, size = Autophagy),
+             alpha = 0.9, stroke = 0.8, show.legend = TRUE) +
+  # Scale manual for color, shape, size
+  scale_color_manual(values = c("Autophagy" = "red", "Other" = "gray60")) +
+  scale_shape_manual(values = c("Autophagy" = 16, "Other" = 16)) +
+  scale_size_manual(values = c("Autophagy" = 3.5, "Other" = 2)) +
+  # Lines
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dotted") +
+  # Labels for significant autophagy genes
+  geom_text_repel(
+    data = label_genes,
+    aes(x = log2FoldChange, y = -log10(padj), label = genename),
+    size = 4,
+    max.overlaps = 50,
+    box.padding = 0.3,
+    point.padding = 0.2
+  ) +
+  theme_bw(base_size = 16) +
+  labs(
+    title = paste0("Volcano plot — ", selected_cytokine),
+    subtitle = fisher_label,
+    x = "log2 Fold Change",
+    y = "-log10(adj p-value)",
+    color = "Gene Type",
+    shape = "Gene Type",
+    size = "Gene Type"
+  )
+
+
+```
+# extract data from volcano -> Venn diagram
+
+```{r}
+### FUNCTION TO RUN ANALYSIS
+### -------------------------------
+analyze_cytokine <- function(cytokine_name, cytokine_data, autophagy, sig_cutoff = 0.05) {
+
+  # Extract dataset
+  df <- cytokine_data[[cytokine_name]]
+
+  # Harmonize gene names
+  df$genename <- toupper(df$genename)
+  autophagy$GENE <- toupper(autophagy$GENE)
+
+  # Tag autophagy genes
+  df$Autophagy <- ifelse(df$genename %in% autophagy$GENE, "Autophagy", "Other")
+
+  # Fisher test
+  background_genes <- df$genename
+  in_auto <- df$genename %in% autophagy$GENE
+  is_sig <- df$padj < sig_cutoff
+
+  tbl <- table(Autophagy = in_auto, Significant = is_sig)
+  fisher_result <- fisher.test(tbl)
+
+  # Genes enriched (autophagy + significant)
+  enriched_genes <- df %>%
+    filter(Autophagy == "Autophagy", padj < sig_cutoff) %>%
+    pull(genename)
+
+  list(
+    df = df,
+    enriched_genes = enriched_genes,
+    fisher = fisher_result
+  )
+}
+
+### -------------------------------
+### RUN FOR BOTH CYTOKINES
+### -------------------------------
+res_IL1b <- analyze_cytokine("IL1b", cytokine_data, autophagy)
+res_TNFa <- analyze_cytokine("TNFa", cytokine_data, autophagy)
+
+# Extract ONLY genes enriched by Fisher analysis + significant
+sig_IL1b  <- res_IL1b$enriched_genes
+sig_TNFa  <- res_TNFa$enriched_genes
+
+### CHECK
+cat("IL1b enriched genes:", length(sig_IL1b), "\n")
+cat("TNFa enriched genes:", length(sig_TNFa), "\n")
+
+### -------------------------------
+### FIX VENN — remove NAs
+### -------------------------------
+sig_IL1b <- sig_IL1b[!is.na(sig_IL1b)]
+sig_TNFa <- sig_TNFa[!is.na(sig_TNFa)]
+
+### -------------------------------
+### DRAW VENN
+### -------------------------------
+venn.plot <- venn.diagram(
+  x = list(
+    IL1b = sig_IL1b,
+    TNFa = sig_TNFa
+  ),
+  filename = NULL,
+  fill = c("#ff9999", "#9999ff"),
+  alpha = 0.5,
+  cex = 2,
+  cat.cex = 2,
+  cat.pos = c(-20, 20)
+)
+
+grid::grid.newpage()
+grid::grid.draw(venn.plot)
+
+### -------------------------------
+### GET GENES EXCLUSIVE TO IL1b
+### -------------------------------
+exclusive_IL1b <- setdiff(sig_IL1b, sig_TNFa)
+exclusive_IL1b
+
+write.csv(
+  data.frame(Gene = exclusive_IL1b),
+  "exclusive_IL1b_genes.csv",
+  row.names = FALSE
+)
+
+cat("\nSaved: exclusive_IL1b_genes.csv\n")
+
+#--------
+### ============================================================
+### Function to extract enriched autophagy genes per cytokine
+### ============================================================
+
+get_autophagy_hits <- function(df, autophagy, sig_cutoff = 0.05) {
+  
+  # harmonize case
+  df$genename <- toupper(df$genename)
+  autophagy$GENE <- toupper(autophagy$GENE)
+  
+  # autophagy present in dataset
+  hits <- df[df$genename %in% autophagy$GENE, ]
+  
+  # significant autophagy genes
+  hits_sig <- hits[hits$padj < sig_cutoff, ]
+  
+  return(hits_sig$genename)
+}
+
+### ============================================================
+### --- RUN FOR IL1b ---
+### ============================================================
+
+df_IL1b <- cytokine_data[["IL1b"]]
+sig_IL1b <- get_autophagy_hits(df_IL1b, autophagy)
+
+### ============================================================
+### --- RUN FOR TNFa ---
+### ============================================================
+
+df_TNFa <- cytokine_data[["TNFa"]]
+sig_TNFa <- get_autophagy_hits(df_TNFa, autophagy)
+
+### ============================================================
+### Compute exclusive + intersect
+### ============================================================
+
+intersect_genes   <- intersect(sig_IL1b, sig_TNFa)
+exclusive_IL1b    <- setdiff(sig_IL1b, sig_TNFa)
+exclusive_TNFa    <- setdiff(sig_TNFa, sig_IL1b)
+
+### ============================================================
+### Save to CSV
+### ============================================================
+
+write.csv(data.frame(gene = exclusive_IL1b),
+          file = "exclusive_IL1b.csv",
+          row.names = FALSE)
+
+write.csv(data.frame(gene = exclusive_TNFa),
+          file = "exclusive_TNFa.csv",
+          row.names = FALSE)
+
+write.csv(data.frame(gene = intersect_genes),
+          file = "intersect_IL1b_TNFa.csv",
+          row.names = FALSE)
+
+### Print summary
+cat("IL1b significant autophagy genes:", length(sig_IL1b), "\n")
+cat("TNFa significant autophagy genes:", length(sig_TNFa), "\n\n")
+
+cat("Exclusive IL1b:", length(exclusive_IL1b), "genes\n")
+cat("Exclusive TNFa:", length(exclusive_TNFa), "genes\n")
+cat("Intersect:", length(intersect_genes), "genes\n")
+
+#------add log2foldchange, adjp----
+# IL1b exclusive genes table
+IL1b_exclusive_table <- df_IL1b %>%
+  filter(genename %in% exclusive_IL1b) %>%
+   dplyr::select(genename, log2FoldChange, padj)
+
+# TNFa exclusive genes table
+TNFa_exclusive_table <- df_TNFa %>%
+  filter(genename %in% exclusive_TNFa) %>%
+  dplyr::select(genename, log2FoldChange, padj)
+
+# Intersect genes table
+intersect_table <- df_IL1b %>%
+  filter(genename %in% intersect_genes) %>%
+   dplyr::select(genename, log2FoldChange, padj)  # can also take from TNFa, should be identical
+
+# Save to CSV
+write.csv(IL1b_exclusive_table, "IL1b_exclusive_genes.csv", row.names = FALSE)
+write.csv(TNFa_exclusive_table, "TNFa_exclusive_genes.csv", row.names = FALSE)
+write.csv(intersect_table, "intersect_IL1b_TNFa_genes.csv", row.names = FALSE)
+
+```
+#-----visualise-----
+
+```{r}
+ggplot(IL1b_exclusive_table, aes(x = reorder(genename, log2FoldChange), y = log2FoldChange)) +
+  geom_bar(stat = "identity", fill = "salmon") +
+  coord_flip() +
+  geom_text(aes(label = round(log2FoldChange, 2)), hjust = -0.1) +
+  theme_bw(base_size = 14) +
+  labs(x = "Gene", y = "log2 Fold Change",
+       title = "IL1b-exclusive autophagy genes") 
+
+#OR
+ggplot(IL1b_exclusive_table, aes(x = log2FoldChange, y = -log10(padj))) +
+  geom_point(color = "salmon", size = 3) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dotted") +
+  geom_text_repel(aes(label = genename), max.overlaps = 20) +
+  theme_bw(base_size = 14) +
+  labs(title = "IL1b-exclusive autophagy genes volcano",
+       x = "log2 Fold Change", y = "-log10(adj p-value)")
+
+# or
+library(pheatmap)
+# Extract IL1b data for exclusive genes
+IL1b_data_for_heatmap <- df_IL1b %>%
+  filter(genename %in% exclusive_IL1b) %>%
+  dplyr::select(genename, log2FoldChange) %>%
+  mutate(condition = "IL1b")
+
+# Extract TNFa data for exclusive genes
+TNFa_data_for_heatmap <- df_TNFa %>%
+  filter(genename %in% exclusive_TNFa) %>%
+  dplyr::select(genename, log2FoldChange) %>%
+  mutate(condition = "TNFa")
+
+# Extract IL1b data for intersect genes (use df_IL1b or df_TNFa as preferred)
+intersect_data_for_heatmap <- df_IL1b %>%
+  filter(genename %in% intersect_genes) %>%
+  dplyr::select(genename, log2FoldChange) %>%
+  mutate(condition = "Intersect")
+
+# Combine all datasets
+all_heatmap_data <- bind_rows(IL1b_data_for_heatmap,
+                              TNFa_data_for_heatmap,
+                              intersect_data_for_heatmap)
+
+# Pivot to wide format (genes as rows, conditions as columns)
+heatmap_wide <- all_heatmap_data %>%
+  pivot_wider(names_from = condition,
+              values_from = log2FoldChange)
+
+# Prepare matrix for heatmap
+heatmap_mat <- as.data.frame(heatmap_wide)
+rownames(heatmap_mat) <- heatmap_mat$genename
+heatmap_mat$genename <- NULL
+heatmap_mat <- as.matrix(heatmap_mat)
+
+# Replace NA values with 0 or other appropriate value
+heatmap_mat[is.na(heatmap_mat)] <- 0
+
+# Optional scaling per gene (row)
+heatmap_scaled <- t(scale(t(heatmap_mat)))
+
+# Plot heatmap
+pheatmap(heatmap_scaled,
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         show_rownames = TRUE,
+         show_colnames = TRUE,
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         main = "log2 Fold Change Heatmap of IL1b, TNFa Exclusive and Intersect Genes")
+
+#or
+IL1b_exclusive_table <- IL1b_exclusive_table %>%
+  mutate(Regulation = ifelse(log2FoldChange > 0, "Up", "Down"))
+
+ggplot(IL1b_exclusive_table, aes(x = reorder(genename, log2FoldChange), y = log2FoldChange, color = Regulation)) +
+  geom_segment(aes(x = genename, xend = genename, y = 0, yend = log2FoldChange), size = 0.8) +
+  geom_point(size = 4) +
+  coord_flip() +
+  scale_color_manual(values = c("Up" = "salmon", "Down" = "lightblue")) +
+  theme_bw(base_size = 14) +
+  labs(x = "Gene", y = "log2 Fold Change",
+       title = "IL1b-exclusive autophagy genes",
+       color = "Regulation")
+```
+# run GSEA from Autophagy analysis (HADB.csv file)
+
+```{r}
+
+# ------------------------
+# Function to run GSEA on any cytokine dataset
+run_gsea <- function(cytokine_df, gene_set, cytokine_name) {
+
+  # --- Filter valid genes (remove NA genename or log2FoldChange) ---
+  valid_genes <- !is.na(cytokine_df$genename) & !is.na(cytokine_df$log2FoldChange)
+  df <- cytokine_df[valid_genes, ]
+  
+  cat("Cytokine dataset:", cytokine_name, "\n",
+      "Number of genes after filtration:", nrow(df), "\n",
+      "Unique genes:", length(unique(df$genename)), "\n\n")
+  
+  # --- Remove duplicated genes (keep first occurrence) ---
+  df <- df[!duplicated(df$genename), ]
+  
+  # --- Create ranking vectors ---
+  # log2FoldChange ranking
+  ranks_lfc <- setNames(df$log2FoldChange, df$genename)
+  ranks_lfc <- sort(ranks_lfc, decreasing = TRUE)
+  
+  # signed p-value ranking
+  df$sign_pval <- -log10(df$pvalue) * sign(df$log2FoldChange)
+  ranks_sign_pval <- setNames(df$sign_pval, df$genename)
+  ranks_sign_pval <- sort(ranks_sign_pval, decreasing = TRUE)
+  
+  # Handle infinite values
+  high_val <- max(ranks_sign_pval[is.finite(ranks_sign_pval)], na.rm = TRUE) + 1
+  ranks_sign_pval[is.infinite(ranks_sign_pval) & ranks_sign_pval > 0] <- high_val
+  
+  # --- Run fgsea ---
+  fgsea_lfc <- fgsea(pathways = gene_set, stats = ranks_lfc)
+  fgsea_pval <- fgsea(pathways = gene_set, stats = ranks_sign_pval)
+  
+  return(list(lfc = fgsea_lfc, sign_pval = fgsea_pval))
+}
+
+# ------------------------
+# Function to plot multiple cytokines on the same y-axis
+plot_gsea_single_axis_labels <- function(gsea_combined, title = "GSEA NES Plot") {
+  
+  gsea_combined <- gsea_combined %>%
+    mutate(
+      padj_label = formatC(padj, format = "f", digits = 3),
+      pathway = factor(pathway, levels = rev(unique(pathway)))
+    )
+  
+  # Cytokine colors
+  cytokine_colors <- setNames(
+    RColorBrewer::brewer.pal(n = length(unique(gsea_combined$Cytokine)), name = "Set2"),
+    unique(gsea_combined$Cytokine)
+  )
+  
+  p <- ggplot(gsea_combined, aes(y = pathway, x = NES, fill = Cytokine)) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.7), alpha = 0.9, width = 0.6) +
+    geom_text(aes(label = padj_label), position = position_dodge(width = 0.7),
+              hjust = -0.1, size = 5, color = "black") +
+    geom_text(aes(x = min(NES) - 0.2*max(NES), label = Cytokine),
+              position = position_dodge(width = 0.7),
+              hjust = 1, size = 5, fontface = "bold", color = "black") +
+    scale_fill_manual(values = cytokine_colors) +
+    labs(title = title, x = "Normalized Enrichment Score (NES)", y = "Pathway", fill = "Cytokine") +
+    theme_bw(base_size = 14) +
+    theme(
+      plot.title = element_text(size = 16, face = "bold"),
+      legend.position = "bottom",
+      axis.text.y = element_text(size = 12),
+      axis.text.x = element_text(size = 12),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor.y = element_blank()
+    )
+  
+  return(p)
+}
+
+# ------------------------
+# Example usage
+# Assuming gsea_all was generated with run_gsea_multiple()
+# Step 1: select which cytokines you want to include
+selected_cytokines <- cytokine_data[c("TNFa", "IL1b")]   # <-- define here
+
+# Step 2: run GSEA for those selected cytokines
+gsea_all <- run_gsea_multiple(selected_cytokines, list(Autophagy = toupper(autophagy_genes)))
+
+plot_single_axis_labels <- plot_gsea_single_axis_labels(gsea_all, title = "Autophagy GSEA — TNFa & IL1b")
+plot_single_axis_labels 
+
+# Save plot
+
+ggsave("GSEA_Autophagy_Multiple_Cytokines.png", plot_single_axis_labels , width = 10, height = 6, dpi = 300)
+
+#-------
+# with the filtered list of autophagy
+# --- Example usage ---
+# Filter autophagy genes from your autophagy list
+autophagy_gene_set <- list(Autophagy = toupper(autophagy$Autophagy))
+
+# Select cytokines to analyze
+selected_cytokines <- cytokine_data[c("TNFa", "IL1b")]
+
+# Run GSEA
+gsea_all <- run_gsea_multiple(selected_cytokines, autophagy_gene_set)
+
+# Plot NES for all cytokines on same y-axis
+p <- plot_gsea_single_axis_labels(gsea_all$lfc, title = "Autophagy GSEA — TNFa & IL1b")
+p
+
+```
+# heat map IL1 exclusive in basal cells (healthy, RA)
+
+```{r}
+ setwd("~/data/Gene expression_healthy RA OA")
+
+    df <- read.csv("nrm_counts_copy_with_be_removed.csv")
+    names(df)
+    
+# load IL1-exclusive gene 
+    il1_genes <- read.csv("IL1b_exclusive_genes.csv",
+                      header = TRUE, stringsAsFactors = FALSE)
+
+# 1. assume df$X holds gene symbols
+colnames(df)[1] <- "gene"
+
+# 2. Keep only non‑TNF samples (drop columns ending with _TNF)
+non_tnf_cols <- c(
+  "gene",
+  grep("_TNF$", colnames(df), invert = TRUE, value = TRUE)
+)
+df_non_tnf <- df[, non_tnf_cols]
+
+# 3. Subset to IL1b‑exclusive genes
+genes_use <- intersect(df_non_tnf$gene, il1_genes$genename)
+# Rebuild numeric matrix cleanly
+mat <- df_non_tnf %>%
+  filter(gene %in% genes_use) %>%
+  column_to_rownames("gene")
+
+# Keep only numeric columns (defensive)
+num_cols <- sapply(mat, is.numeric)
+mat <- as.matrix(mat[, num_cols, drop = FALSE])
+
+# Remove genes with no numeric data
+mat <- mat[rowSums(is.na(mat)) < ncol(mat), , drop = FALSE]
+
+# Log2 transform; replace remaining NA with 0 (or a small value) if needed
+mat_log <- log2(mat + 1)
+
+# Optionally drop rows that are all zero after log
+mat_log <- mat_log[rowSums(mat_log) > 0, , drop = FALSE]
+
+# Z‑score per gene
+mat_scaled <- t(scale(t(mat_log)))
+
+
+# 1) Remove rows with any NA/NaN/Inf
+bad_row <- !is.finite(rowSums(mat_scaled))
+mat_scaled_clean <- mat_scaled[!bad_row, , drop = FALSE]
+
+# 2) Remove columns with any NA/NaN/Inf (should be rare)
+bad_col <- !is.finite(colSums(mat_scaled_clean))
+mat_scaled_clean <- mat_scaled_clean[, !bad_col, drop = FALSE]
+
+# 3) Optional: if any row has zero variance, remove (scale() can create NaN)
+var0 <- apply(mat_scaled_clean, 1, function(x) var(x, na.rm = TRUE) == 0)
+mat_scaled_clean <- mat_scaled_clean[!var0, , drop = FALSE]
+
+# 4) Now plot
+pheatmap(
+  mat_scaled_clean,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  annotation_col = annotation_col[colnames(mat_scaled_clean), , drop = FALSE],
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  fontsize_row = 8,
+  fontsize_col = 8,
+  main = "IL1b-exclusive autophagy genes (non-treated samples)"
+)
+
+#-----------
+## plot only RA Knee (healthy were all knee)
+
+# Vector of samples to keep
+samples_keep <- c("Healthy_81", "Healthy_82", "Healthy_83",
+                  "RA_196", "RA_217", "RA_280", "RA_336", "RA_346", "RA_368")
+
+# Subset and reorder columns
+keep <- intersect(samples_keep, colnames(mat_scaled_clean))
+mat_sub <- mat_scaled_clean[, keep, drop = FALSE]
+
+# Annotation: Healthy vs RA, in this order
+condition <- ifelse(grepl("^Healthy", keep), "Healthy", "RA")
+annotation_col <- data.frame(
+  Condition = factor(condition, levels = c("Healthy", "RA")),
+  row.names = keep
+)
+
+png("IL1b_exclusive_autophagy_Healthy_RA_heatmap.png",
+    width = 2000, height = 1600, res = 300)
+pheatmap(
+  mat_sub,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  annotation_col = annotation_col,
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  fontsize_row = 8,
+  fontsize_col = 8,
+  main = "IL1b-exclusive autophagy genes (Healthy vs RA)"
+)
+dev.off()
