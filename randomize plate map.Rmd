@@ -1,0 +1,156 @@
+-------
+For: Screening plate map design - 384 well plate
+Author: Mim
+20/2/2026
+------
+
+```{r}
+library(openxlsx2)
+library(ggplot2)
+library(dplyr)
+
+```
+Generate Plate.
+
+```{r}
+set.seed(123)
+
+# ---------------- PARAMETERS ----------------
+n_donors <- 16
+n_row <- 16
+n_col <- 24
+
+n_drug  <- 280
+n_dmso  <- 24
+n_pos   <- 16
+n_cross_total <- 30
+
+drug_ids <- paste0("Drug", sprintf("%03d", 1:n_drug))
+pos_ids  <- paste0("PosCtrl_", sprintf("%02d", 1:n_pos))
+donors   <- paste0("Donor", sprintf("%02d", 1:n_donors))
+
+# ------------- PLATE TEMPLATE --------------
+plate_template <- expand.grid(
+  Row = LETTERS[1:n_row],
+  Col = 1:n_col
+)
+
+plate_template$Well <- paste0(plate_template$Row, plate_template$Col)
+
+# ---- 2x2 blocks at each corner (16 wells total) ----
+corner_dmso <- c(
+  # Top left
+  "A1","A2","B1","B2",
+  # Top right
+  "A23","A24","B23","B24",
+  # Bottom left
+  "O1","O2","P1","P2",
+  # Bottom right
+  "O23","O24","P23","P24"
+)
+
+# Create workbook
+wb <- wb_workbook()
+
+# ------------- LOOP THROUGH DONORS ----------
+for (d in donors) {
+
+  plate <- plate_template
+  
+  plate$Donor <- d
+  plate$Type <- "Empty"
+  plate$ID <- NA
+  
+  # ----- DMSO -----
+  extra_dmso <- sample(
+    setdiff(plate$Well, corner_dmso),
+    n_dmso - length(corner_dmso)
+  )
+  
+  dmso_wells <- c(corner_dmso, extra_dmso)
+  
+  # ----- Positive controls -----
+  remaining <- setdiff(plate$Well, dmso_wells)
+  pos_wells <- sample(remaining, n_pos)
+  
+  # ----- Cross-donor duplicated -----
+  remaining <- setdiff(remaining, pos_wells)
+  
+  other_donors <- setdiff(donors, d)
+  cross_ids <- rep(other_donors, each = 2)
+  
+  cross_wells <- sample(remaining, n_cross_total)
+  
+  # ----- Drug wells -----
+  remaining <- setdiff(remaining, cross_wells)
+  drug_wells <- sample(remaining, n_drug)
+  
+  # ----- Assign -----
+  plate$Type[plate$Well %in% dmso_wells] <- "DMSO"
+  
+  plate$Type[plate$Well %in% pos_wells] <- "Positive"
+  plate$ID[plate$Well %in% pos_wells] <- pos_ids
+  
+  plate$Type[plate$Well %in% cross_wells] <- "CrossDonor"
+  plate$ID[plate$Well %in% cross_wells] <- cross_ids
+  
+  plate$Type[plate$Well %in% drug_wells] <- "Drug"
+  plate$ID[plate$Well %in% drug_wells] <- drug_ids
+  
+  # Add sheet
+  wb$add_worksheet(d)
+  wb$add_data(d, plate)
+}
+
+wb$save("384well_16Donor_FinalDesign.xlsx")
+
+
+```
+Export to Excel
+
+```{r}
+# SAVE FILE
+wb$save("384well_16Donor_FinalDesign.xlsx")
+
+```
+
+Generate Plate Image
+
+```{r}
+
+plate <- read_xlsx("384well_16Donor_FinalDesign.xlsx", sheet = "Donor01")
+
+plate_plot <- plate %>%
+  mutate(Row = factor(Row, levels = rev(LETTERS[1:16])))
+
+ggplot(plate_plot, aes(x = Col, y = Row, fill = Type)) +
+  geom_tile(color = "black") +
+  scale_x_continuous(breaks = 1:24, expand = c(0, 0)) +
+  scale_y_discrete(expand = c(0, 0)) + 
+  scale_fill_manual(values = c(
+    "Empty" = "white",
+    "Positive" = "#FF6666",   # light red
+    "Drug" = "#8DA0CBFF",     #6666FF
+    "DMSO" = "#A6D854FF",
+    "CrossDonor" = "#E5C494FF"
+      )) +
+  labs(
+    title = "384-Well Plate Layout",
+    x = "Column",
+    y = "Row",
+    fill = "Condition"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    axis.text = element_text(size = 14),
+    legend.text = element_text(size = 14),   # increase legend item font
+    legend.title = element_text(size = 16)   # increase legend title font
+  )
+
+ggsave("Donor01_plate_layout.png",
+       width = 10,
+       height = 7,
+       dpi = 600)
+
+```
