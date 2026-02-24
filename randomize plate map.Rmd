@@ -8,6 +8,7 @@ Author: Mim
 library(openxlsx2)
 library(ggplot2)
 library(dplyr)
+setwd("~/data/plate layout RANDOM generator")
 
 ```
 Generate Plate.
@@ -20,10 +21,10 @@ n_donors <- 16
 n_row <- 16
 n_col <- 24
 
-n_drug  <- 280
+n_drug  <- 270
 n_dmso  <- 24
 n_pos   <- 16
-n_cross_total <- 30
+n_cross_total <- 60
 
 drug_ids <- paste0("Drug", sprintf("%03d", 1:n_drug))
 pos_ids  <- paste0("PosCtrl_", sprintf("%02d", 1:n_pos))
@@ -62,12 +63,8 @@ for (d in donors) {
   plate$ID <- NA
   
   # ----- DMSO -----
-  extra_dmso <- sample(
-    setdiff(plate$Well, corner_dmso),
-    n_dmso - length(corner_dmso)
-  )
-  
-  dmso_wells <- c(corner_dmso, extra_dmso)
+  # Sample n_dmso wells randomly across the plate (no corner restriction)
+  dmso_wells <- sample(plate$Well, n_dmso)
   
   # ----- Positive controls -----
   remaining <- setdiff(plate$Well, dmso_wells)
@@ -118,7 +115,7 @@ Generate Plate Image
 
 ```{r}
 
-plate <- read_xlsx("384well_16Donor_FinalDesign.xlsx", sheet = "Donor01")
+plate <- read_xlsx("384well_16Donor_FinalDesign.xlsx", sheet = "Donor02")
 
 plate_plot <- plate %>%
   mutate(Row = factor(Row, levels = rev(LETTERS[1:16])))
@@ -152,5 +149,6 @@ ggsave("Donor01_plate_layout.png",
        width = 10,
        height = 7,
        dpi = 600)
+
 
 ```
