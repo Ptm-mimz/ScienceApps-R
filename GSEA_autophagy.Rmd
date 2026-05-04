@@ -1,0 +1,1014 @@
+GSEA analysis
+authour: Mim
+Date: 5/2/2026
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(readr)
+library(clusterProfiler)
+library(tibble)
+library(forcats)
+library(purrr)
+library(ComplexUpset)
+library(ggplot2)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(ReactomePA)
+library(msigdbr)
+library(patchwork)
+library(pheatmap)
+library(ggrepel)
+
+```
+Load data
+
+```{r}
+
+
+# Base directory
+base_dir <- "/shares/rheumatologie.usz/mim/GSEA analysis"
+
+# Load raw file
+cytokine_data <- readRDS(
+  file.path(base_dir, "ra_de_list_only_expressed_genes.rds")
+)
+
+names(cytokine_data)
+
+#Load autophagy genes
+autophagy <- readr::read_csv(
+  file.path(base_dir, "HADB.csv")
+)
+
+# Base directory where the GMT files are
+gmt_dir <- "/home/plapha/data/Cytokine stimulation gene Tsuchiya et al/autophagy genes/autophagy GSEA"
+
+gmt_files <- c(
+  "GOBP_NEGATIVE_REGULATION_OF_AUTOPHAGY.v2026.1.Hs.gmt",
+  "GOBP_POSITIVE_REGULATION_OF_AUTOPHAGY.v2026.1.Hs.gmt",
+  "GOBP_MITOPHAGY.v2026.1.Hs.gmt",
+  "GOBP_REGULATION_OF_AUTOPHAGY.v2026.1.Hs.gmt"
+)
+
+# Named list: one TERM2GENE per pathway
+term2gene_list <- setNames(
+  lapply(gmt_files, function(f) {
+    suppressWarnings(read.gmt(file.path(gmt_dir, f)))
+  }),
+  gsub("\\.v2026\\.1\\.Hs\\.gmt", "", gmt_files)
+)
+
+names(term2gene_list)
+
+```
+# Prepare TERM2GENE for GSEA
+ 
+```{r}
+term2gene <- autophagy %>%
+  transmute(
+    term = "Autophagy",
+    gene = GENE
+  ) %>%
+  distinct()
+
+
+```
+# Helper functions
+ 
+```{r}
+replace_0 <- function(x, eps = 1e-10) {
+  x[x == 0 | is.na(x)] <- eps
+  x
+}
+
+run_gsea <- function(df) {
+
+  stopifnot(all(c("genename", "log2FoldChange", "pvalue") %in% colnames(df)))
+
+  set.seed(123)
+
+  df_ranked <- df %>%
+    mutate(
+      pvalue = ifelse(pvalue == 0 | is.na(pvalue), 1e-10, pvalue),
+      rank = sign(log2FoldChange) * -log10(pvalue)
+    ) %>%
+    group_by(genename) %>%
+    slice_min(order_by = pvalue, n = 1, with_ties = FALSE) %>%
+    ungroup()
+
+  genes4gsea <- setNames(df_ranked$rank, df_ranked$genename) %>%
+    sort(decreasing = TRUE)
+
+  clusterProfiler::GSEA(
+    genes4gsea,
+    TERM2GENE = term2gene,
+    pvalueCutoff = 1,
+    maxGSSize = 1000,
+    nPermSimple = 10000,
+    seed = TRUE,
+    scoreType = "std",
+    eps = 0
+  )
+}
+
+
+```
+
+## Run GSEA for each cytokine
+
+```{r}
+
+gsea_results <- imap(cytokine_data, function(df, stim) {
+  message("Running GSEA for ", stim)
+  run_gsea(df)
+})
+
+names(gsea_results)
+
+
+## ===============================
+## Format summaries
+## ===============================
+gsea_summary <- imap_dfr(
+  gsea_results,
+  ~ as_tibble(.x@result) %>%
+      mutate(
+        cytokine = .y,
+        p_display = case_when(
+          p.adjust < 0.001 ~ "< 0.001",
+          p.adjust < 0.01  ~ "< 0.01",
+          p.adjust < 0.1   ~ "< 0.1",
+          TRUE ~ as.character(round(p.adjust, 2))
+        ),
+        significant = p.adjust < 0.01
+      )
+)
+
+gsea_summary
+
+```
+
+## Run GSEA for each cytokine --> for gmt file list
+
+```{r}
+
+cytokines_keep <- c("IFNg", "TNFa", "IL1b")
+
+replace_0 <- function(x, eps = 1e-300) {
+  x[x == 0] <- eps
+  x
+}
+
+gsea_all <- imap(
+  cytokine_data[cytokines_keep],
+  function(df, stim) {
+    imap(
+      term2gene_list,
+      function(t2g, pathway) {
+        message("Running ", stim, " – ", pathway)
+        run_gsea(df, t2g)
+      }
+    )
+  }
+)
+
+
+```
+# Plot GSEA
+Helper plotting function
+
+```{r}
+
+plot_gsea_single <- function(gsea_res, title, colors = NULL) {
+
+  stopifnot(inherits(gsea_res, "gseaResult"))
+
+  gseaplot2(
+    gsea_res,
+    geneSetID = 1,           # only autophagy
+    pvalue_table = TRUE,
+    color = colors,
+    title = title
+  )
+}
+
+## batch for selected cytokines
+
+cytokines_keep <- c("IL1b")   #"IFNg", "TNFa",
+
+for (stim in cytokines_keep) {
+  p <- plot_gsea_single(
+    gsea_results[[stim]],
+    title = paste0(stim, " ")
+  )
+  
+  print(p)
+  
+  ggsave(
+    filename = paste0("GSEA_", stim, ".pdf"),
+    plot = p,
+    width = 6,
+    height = 5
+  )
+}
+
+##### run below here if use gmt ####
+
+plot_dir <- "GSEA_plots"
+dir.create(plot_dir, showWarnings = FALSE)
+
+plot_gsea_curve <- function(gsea_res, cytokine, pathway) {
+
+  if (nrow(gsea_res@result) == 0) return(NULL)
+
+  p <- gseaplot2(
+    gsea_res,
+    geneSetID = 1,
+    title = paste(cytokine, pathway, sep = " – "),
+    pvalue_table = TRUE
+  )
+
+  ggsave(
+    filename = file.path(
+      plot_dir,
+      paste0(cytokine, "_", pathway, "_GSEA.pdf")
+    ),
+    plot = p,
+    width = 8,
+    height = 6
+  )
+
+  p
+}
+
+
+gsea_plots <- imap(
+  gsea_all,
+  function(pathway_list, cytokine) {
+    imap(
+      pathway_list,
+      function(gsea_res, pathway) {
+        plot_gsea_curve(gsea_res, cytokine, pathway)
+      }
+    )
+  }
+)
+
+```
+# Leading-edge extraction (core enrichment genes)
+
+```{r}
+extract_leading_edge <- function(gsea_res, df_deg, cytokine) {
+
+  # get GSEA table
+  res <- as_tibble(gsea_res@result)
+
+  # only autophagy term (row 1)
+  le_genes <- res$core_enrichment[1] %>%
+    strsplit("/") %>%
+    unlist()
+
+  # add DEG info
+  le_df <- df_deg %>%
+    filter(genename %in% le_genes) %>%
+    mutate(
+      direction = case_when(
+        log2FoldChange > 0 ~ "Up",
+        log2FoldChange < 0 ~ "Down"
+      ),
+      cytokine = cytokine
+    )
+
+  le_df
+}
+
+####from gmt file ####
+
+extract_leading_edge <- function(gsea_res, cytokine, pathway) {
+
+  if (nrow(gsea_res@result) == 0) return(NULL)
+
+  res <- gsea_res@result[1, ]
+
+  tibble(
+    genename = unlist(strsplit(res$core_enrichment, "/")),
+    cytokine = cytokine,
+    pathway = pathway,
+    NES = res$NES,
+    direction = ifelse(res$NES > 0, "Up", "Down")
+  )
+}
+
+
+leading_edge_df <- imap_dfr(
+  gsea_all,
+  function(pathway_list, cytokine) {
+    imap_dfr(
+      pathway_list,
+      function(gsea_res, pathway) {
+        extract_leading_edge(gsea_res, cytokine, pathway)
+      }
+    )
+  }
+)
+
+table(leading_edge_df$pathway, leading_edge_df$cytokine)
+
+
+```
+# Run leading-edge extraction
+
+```{r}
+cytokines_keep <- c("IL1b")  #"IFNg", "TNFa", 
+
+leading_edge_df <- bind_rows(
+  lapply(cytokines_keep, function(stim) {
+    extract_leading_edge(
+      gsea_res = gsea_results[[stim]],
+      df_deg   = cytokine_data[[stim]],
+      cytokine = stim
+    )
+  })
+)
+
+leading_edge_df
+
+
+#-----plot directly from leading edge----
+
+# bar plot -------------------
+
+plot_leading_edge_bar <- function(df, top_n = 20) {
+  
+  df_plot <- df %>%
+    mutate(rank_score = sign(log2FoldChange) * -log10(pvalue)) %>%
+    arrange(desc(abs(rank_score))) %>%
+    slice_head(n = top_n) %>%
+    mutate(
+      genename = factor(genename, levels = rev(genename)),
+      direction = ifelse(log2FoldChange > 0, "Up", "Down")
+    )
+  
+  ggplot(df_plot, aes(x = genename, y = rank_score, fill = direction)) +
+    geom_col() +
+    coord_flip() +
+    labs(
+      title = "Leading-edge genes (Autophagy)",
+      x = NULL,
+      y = "Rank score"
+    ) +
+    theme_bw(base_size = 14)
+}
+
+p_bar <- plot_leading_edge_bar(leading_edge_df, top_n = 25)
+print(p_bar)
+
+ggsave("LeadingEdge_barplot.pdf", p_bar, width = 6, height = 5)
+
+
+
+## Volcano --------------------
+
+leading_edge_il1b <- leading_edge_df %>%
+  dplyr::filter(cytokine == "IL1b")
+
+
+plot_leading_edge_only <- function(df_deg, leading_edge,
+                                  lfc_thresh = 0.5,
+                                  p_thresh = 0.05) {
+  
+  df_plot <- df_deg %>%
+    mutate(
+      pvalue = replace_0(pvalue),
+      neglog10p = -log10(pvalue)
+    ) %>%
+    filter(genename %in% leading_edge$genename) %>%
+    mutate(
+      pass_thresh = abs(log2FoldChange) > lfc_thresh & pvalue < p_thresh
+    )
+  
+  ggplot(df_plot, aes(x = log2FoldChange, y = neglog10p)) +
+    geom_point(aes(color = pass_thresh), size = 2) +
+    
+    # label only meaningful genes
+    geom_text_repel(
+      data = subset(df_plot, pass_thresh),
+      aes(label = genename),
+      size = 3,
+      max.overlaps = 20
+    ) +
+    
+    geom_hline(yintercept = -log10(p_thresh), linetype = "dashed") +
+    geom_vline(xintercept = c(-lfc_thresh, lfc_thresh), linetype = "dashed") +
+    
+    scale_color_manual(values = c("grey70", "red")) +
+    
+    labs(
+      title = "Leading-edge genes (filtered)",
+      x = "log2 Fold Change",
+      y = "-log10(pvalue)",
+      color = "Significant"
+    ) +
+    theme_bw(base_size = 14)
+}
+
+p_le <- plot_leading_edge_only(
+  df_deg = cytokine_data[["IL1b"]],
+  leading_edge = leading_edge_il1b,
+  lfc_thresh = 0.5,
+  p_thresh = 0.001
+)
+
+print(p_le)
+
+ggsave("LeadingEdge_only_IL1b.pdf", p_le, width = 6, height = 5)
+
+# plot bar from volcano----------
+
+
+extract_leading_edge_filtered <- function(df_deg, leading_edge,
+                                          lfc_thresh = 0.5,
+                                          padj_thresh = 0.05) {
+  
+  df_deg %>%
+    filter(genename %in% leading_edge$genename) %>%
+    mutate(padj = ifelse(is.na(padj), 1, padj)) %>%
+    filter(
+      abs(log2FoldChange) > lfc_thresh,
+      padj < padj_thresh
+    ) %>%
+    arrange(padj)
+}
+
+le_filtered <- extract_leading_edge_filtered(
+  df_deg = cytokine_data[["IL1b"]],
+  leading_edge = leading_edge_il1b,
+  lfc_thresh = 0.5,
+  padj_thresh = 0.05
+)
+
+le_filtered
+
+
+
+plot_le_bar <- function(df, top_n = 20) {
+  
+  df_plot <- df %>%
+    slice_head(n = top_n) %>%
+    mutate(
+      genename = factor(genename, levels = rev(genename)),
+      direction = ifelse(log2FoldChange > 0, "Up", "Down"),
+      neglog10padj = -log10(padj)
+    )
+  
+  ggplot(df_plot, aes(x = genename, y = log2FoldChange, fill = neglog10padj)) +
+    geom_col() +
+    coord_flip() +
+    
+    scale_fill_gradient(
+      low = "lightblue",
+      high = "red"
+    ) +
+    
+    labs(
+      title = "Leading-edge genes (Autophagy, IL1b)",
+      x = NULL,
+      y = "log2 Fold Change",
+      fill = "-log10(padj)"
+    ) +
+    
+    theme_bw(base_size = 14)
+}
+
+p_bar <- plot_le_bar(le_filtered, top_n = 20)
+
+print(p_bar)
+
+ggsave("LeadingEdge_bar_IL1b.pdf", p_bar, width = 6, height = 5)
+
+
+
+```
+# Prepare data for UpSet plot
+
+```{r}
+upset_input <- leading_edge_df %>%
+  mutate(set = paste(cytokine, direction, sep = "_")) %>%
+  select(genename, set) %>%
+  distinct()
+
+#Convert to list format (UpSetR style)
+upset_list <- split(upset_input$genename, upset_input$set)
+
+
+```
+# Make the UpSet plot
+
+```{r}
+
+leading_edge_df %>%
+  mutate(set = paste(cytokine, direction, sep = "_")) %>%
+  distinct(genename, set) %>%
+  pivot_wider(
+    names_from = set,
+    values_from = genename,
+    values_fn = length,
+    values_fill = 0
+  ) %>%
+  ComplexUpset::upset(
+    intersect = colnames(.)[-1],
+    name = "Autophagy leading-edge genes"
+  )
+# sanity check
+
+leading_edge_df %>%
+  count(cytokine, direction)
+
+
+upset_df <- leading_edge_df %>%
+  filter(cytokine %in% c("IFNg", "TNFa", "IL1b")) %>%
+  mutate(set = paste(cytokine, direction, sep = "_")) %>%
+  distinct(genename, set) %>%
+  mutate(value = TRUE) %>%
+  pivot_wider(
+    names_from = set,
+    values_from = value,
+    values_fill = FALSE
+  )
+
+colnames(upset_df)
+
+# plot the UpSet
+
+p <- ComplexUpset::upset(
+  upset_df,
+  intersect = c("IFNg_Up", "TNFa_Up", "IL1b_Up"),
+  name = "Autophagy leading-edge genes",
+  width_ratio = 0.2
+)
+
+# Save the plot
+ggsave(
+  filename = "UpSet_Autophagy_IL1b_IFNg_TNFa.pdf",
+  plot = p,           # the ggplot object returned by upset()
+  width = 6,
+  height = 5
+)
+
+```
+# Upset plot from gmt file
+
+```{r}
+
+upset_dir <- "UpSet_plots"
+dir.create(upset_dir, showWarnings = FALSE)
+
+make_upset_df <- function(df, pw_name, direction = "Up") {
+  df %>%
+    # keep only this pathway and direction
+    filter(pathway == pw_name, direction == direction) %>%
+    # now distinct gene × cytokine within this pathway only
+    distinct(genename, cytokine) %>%
+    # assign presence = 1
+    mutate(value = 1) %>%
+    # pivot only columns for cytokines
+    pivot_wider(
+      names_from = cytokine,
+      values_from = value,
+      values_fill = 0
+    )
+}
+
+
+lapply(unique(leading_edge_df$pathway), function(pw) {
+  df_up <- make_upset_df(leading_edge_df, pw, "Up")
+  colSums(df_up[cytokines_keep])  # sum genes per cytokine
+})
+
+
+# the plots
+
+for(pw in unique(leading_edge_df$pathway)) {
+
+  df_upset <- make_upset_df(leading_edge_df, pw, "Up")
+
+  p <- ComplexUpset::upset(
+    df_upset,
+    intersect = cytokines_keep,
+    name = paste("Leading-edge genes –", pw)
+  )
+
+  ggsave(
+    filename = file.path(upset_dir, paste0(pw, "_UpSet.pdf")),
+    plot = p,
+    width = 6,
+    height = 5
+  )
+}
+
+
+```
+# Extract genes exclusive to IL1b
+
+```{r}
+# Filter for IL1b Up only
+il1b_up_exclusive <- leading_edge_df %>%
+  filter(cytokine == "IL1b", direction == "Up") %>%
+  filter(!genename %in% leading_edge_df$genename[leading_edge_df$cytokine %in% c("IFNg","TNFa")]) %>%
+  select(genename, log2FoldChange, pvalue)
+
+il1b_up_exclusive
+
+### for gmt 
+
+get_IL1b_exclusive <- function(df_leading, pw_name, cytokine_col = "IL1b", other_cytokines = c("IFNg", "TNFa")) {
+  df_upset <- make_upset_df(df_leading, pw_name, direction = "Up")
+  
+  df_upset %>%
+    filter(!!sym(cytokine_col) == 1) %>%
+    filter(rowSums(across(all_of(other_cytokines))) == 0) %>%
+    pull(genename)
+}
+
+get_IL1b_expr <- function(df_leading, pw_name) {
+  genes <- get_IL1b_exclusive(df_leading, pw_name)
+  
+  cytokine_data$IL1b %>%
+    filter(genename %in% genes) %>%
+    mutate(
+      p_neglog10 = -log10(pvalue)
+    )
+}
+
+```
+# plot for genes exclusive to IL1b
+
+```{r}
+
+# Order genes by log2FoldChange for clarity
+plot_df <- il1b_up_exclusive %>%
+  arrange(log2FoldChange) %>%
+  mutate(genename = factor(genename, levels = genename))
+
+plot_df <- plot_df %>%
+  mutate(p_neglog10 = -log10(pvalue))
+
+p <-  ggplot(plot_df, aes(x = genename, y = log2FoldChange, color = p_neglog10)) +
+  geom_point(size = 4) +
+  scale_color_viridis_c(option = "plasma", direction = -1) +  # reverse: higher = darker = more significance
+  theme_bw(base_size = 14) +
+  labs(
+    title = "IL1b Up-Regulated Exclusive Autophagy Genes",
+    x = "Gene",
+    y = "log2 Fold Change",
+    color = "-log10(p-value)"
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p)
+
+# Save as PDF
+ggsave(
+  filename = "IL1b_Up_Exclusive_genes.pdf",
+  plot = p,
+  width = 8,
+  height = 5
+)
+
+
+##### for gmt ####
+
+plot_IL1b_exclusive <- function(df_expr, pw_name, save_dir = "IL1b_exclusive_plots") {
+  dir.create(save_dir, showWarnings = FALSE)
+  
+  p <- ggplot(df_expr, aes(x = genename, y = log2FoldChange, color = p_neglog10)) +
+    geom_point(size = 3) +
+    scale_color_viridis_c(option = "viridis") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    theme_bw(base_size = 14) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(
+      title = paste("IL1b Up-regulated exclusive genes –", pw_name),
+      x = "Gene",
+      y = "log2 Fold Change",
+      color = "-log10(p-value)"
+    )
+  
+  ggsave(
+    filename = file.path(save_dir, paste0("IL1b_", pw_name, "_exclusive.pdf")),
+    plot = p,
+    width = 7,
+    height = 5
+  )
+  
+  p
+}
+
+plots_IL1b <- map(
+  unique(leading_edge_df$pathway),
+  function(pw) {
+    df_expr <- get_IL1b_expr(leading_edge_df, pw)
+    if(nrow(df_expr) > 0) {
+      plot_IL1b_exclusive(df_expr, pw)
+    } else {
+      message("No IL1b-exclusive genes in ", pw)
+      NULL
+    }
+  }
+)
+
+names(plots_IL1b) <- unique(leading_edge_df$pathway)
+
+
+```
+# pathway analysis from KEGG
+
+```{r}
+
+#Select cytokine dataset
+
+deg_df <- cytokine_data$IL1b
+
+head(deg_df)
+
+## 3. Convert gene symbol -> Entrez ID
+gene_df <- bitr(
+  deg_df$genename,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+)
+
+## merge with DEG table
+gene_df <- gene_df %>%
+  left_join(deg_df, by = c("SYMBOL" = "genename"))
+
+gene_df <- gene_df %>%
+  group_by(ENTREZID) %>%
+  slice_max(order_by = abs(log2FoldChange), n = 1) %>%
+  ungroup()
+
+## ===============================
+## 4. Create ranked gene list
+## ===============================
+
+gene_list <- gene_df$log2FoldChange
+names(gene_list) <- gene_df$ENTREZID
+
+gene_list <- sort(gene_list, decreasing = TRUE)
+
+## ===============================
+## 5. Run KEGG GSEA
+## ===============================
+
+      # gsea_res <- gseKEGG(
+      #   geneList = gene_list,
+      #   organism = "hsa",
+      #   pvalueCutoff = 0.05,
+      #   use_internal_data = TRUE
+      # )
+      # 
+      # ## check results
+      # head(gsea_res@result)
+
+### 5. Run Reactome GSEA
+
+gsea_res <- gsePathway(
+  geneList = gene_list,
+  organism = "human",
+  pvalueCutoff = 0.05
+)
+
+head(gsea_res@result)
+
+head(gsea_res@result[, c("Description","NES","p.adjust")], 20)
+
+## ===============================
+## 6. Visualization
+## ===============================
+
+## Dotplot (best overview)
+dotplot(gsea_res, showCategory = 20) +
+  ggtitle("Pathway Enrichment")
+
+## Ridgeplot
+ridgeplot(gsea_res, showCategory = 20)
+
+
+#To specifically check autophagy / mitophagy
+gsea_res@result %>%
+  dplyr::filter(grepl("autophagy|mitophagy|lysosome|mitochond", Description, ignore.case = TRUE))
+
+
+
+## ===============================
+## 7. Plot specific pathway
+## ===============================
+
+# choose pathway ID
+gseaplot2(
+  gsea_res,
+  geneSetID = gsea_res@result$ID[1],
+  title = gsea_res@result$Description[1]
+)
+
+## ===============================
+## 8. Save results
+## ===============================
+
+write.csv(
+  gsea_res@result,
+  file = file.path(base_dir, "KEGG_GSEA_results.csv"),
+  row.names = FALSE
+)
+
+```
+# Run GSEA on database MSigDB.
+
+
+```{r}
+# Recreate gene list using gene symbols
+deg_df <- cytokine_data$IL1b
+
+gene_list <- deg_df$log2FoldChange
+names(gene_list) <- deg_df$genename
+
+gene_list <- sort(gene_list, decreasing = TRUE)
+
+
+gene_list <- gene_list[!duplicated(names(gene_list))]
+
+# get gene set from database
+msig <- msigdbr(species = "Homo sapiens")
+
+mito_sets <- msig %>%
+  filter(gs_name %in% c(
+    "REACTOME_AUTOPHAGY",
+    "REACTOME_MITOPHAGY",
+    "REACTOME_MACROAUTOPHAGY",
+    "REACTOME_PINK_PARKIN_MEDIATED_MITOPHAGY",
+    "REACTOME_LYSOSOME_VESICLE_BIOGENESIS",
+    "REACTOME_RESPIRATORY_ELECTRON_TRANSPORT"
+  )) %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+# Convert to TERM2GENE format
+term2gene <- msig %>%
+  filter(gs_name %in% c(
+    "REACTOME_AUTOPHAGY",
+    "REACTOME_MITOPHAGY",
+    "REACTOME_MACROAUTOPHAGY",
+    "REACTOME_PINK_PARKIN_MEDIATED_MITOPHAGY",
+    "REACTOME_LYSOSOME_VESICLE_BIOGENESIS",
+    "REACTOME_RESPIRATORY_ELECTRON_TRANSPORT"
+  )) %>%
+  dplyr::select(gs_name, gene_symbol)
+
+# run GSEA
+gsea_res <- GSEA(
+  geneList = gene_list,
+  TERM2GENE = term2gene,
+  pvalueCutoff = 1
+)
+
+gsea_res@result
+
+# Plot
+
+gseaplot2(gsea_res, geneSetID = "REACTOME_AUTOPHAGY") 
+gseaplot2(gsea_res, geneSetID = "REACTOME_MITOPHAGY")
+gseaplot2(gsea_res, geneSetID = "REACTOME_RESPIRATORY_ELECTRON_TRANSPORT")
+
+# check if pathway is enriched
+gsea_res@result[, c("ID","NES","pvalue","p.adjust")]
+
+````
+# nicer Plot
+
+```{R}
+
+plot_and_save_gsea <- function(gsea_res, pathway, filename){
+
+  p <- gseaplot2(
+    gsea_res,
+    geneSetID = pathway,
+    subplots = c(1,2,3),
+    rel_heights = c(1.5,0.5,1),
+    title = gsub("REACTOME_", "", pathway),
+    pvalue_table = TRUE   # automatically adds NES, p, padj
+  )
+
+  ggsave(paste0(filename, ".png"), p, width = 8, height = 6, dpi = 300)
+  ggsave(paste0(filename, ".pdf"), p, width = 8, height = 6)
+
+  return(p)
+}
+
+
+## generate plots
+
+
+plot_and_save_gsea(gsea_res,"REACTOME_AUTOPHAGY","GSEA_AUTOPHAGY")
+
+plot_and_save_gsea(gsea_res,"REACTOME_MITOPHAGY","GSEA_MITOPHAGY")
+
+plot_and_save_gsea(gsea_res,"REACTOME_RESPIRATORY_ELECTRON_TRANSPORT","GSEA_ETC")
+
+
+````
+# Leading edge 
+
+```{R}
+# Extract leading edge string
+le_string <- gsea_res@result %>%
+  filter(ID == "REACTOME_MITOPHAGY") %>%
+  pull(core_enrichment)
+
+# Convert to vector
+leading_edge_genes <- unlist(strsplit(le_string, "/"))
+
+leading_edge_genes
+
+
+## Get fold changes for those genes
+le_df <- data.frame(
+  gene = leading_edge_genes,
+  log2FC = gene_list[leading_edge_genes]
+) %>%
+  na.omit() %>%
+  arrange(desc(log2FC))
+
+le_df$padj <- cytokine_data$IL1b$padj[
+  match(le_df$gene, cytokine_data$IL1b$genename)
+]
+
+# plot
+
+
+p <- ggplot(le_df, aes(x = reorder(gene, log2FC), y = log2FC)) +
+  geom_col(aes(fill = log2FC)) +
+  geom_point(aes(size = -log10(padj)), color = "black") +
+  coord_flip() +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red") +
+  labs(
+    title = "Mitophagy Leading Edge Genes",
+    y = "log2 Fold Change",
+    size = "-log10(padj)"
+  ) +
+  theme_minimal()
+
+ggsave("Mitophagy_LeadingEdge.png", plot = p, width = 7, height = 5, dpi = 300)
+
+```
+# Overlay leading edge genes on GSEA curve
+
+```{R}
+le_string <- gsea_res@result$core_enrichment[
+  gsea_res@result$ID == "REACTOME_MITOPHAGY"
+]
+
+leading_edge_genes <- unlist(strsplit(le_string, "/"))
+
+gene_rank <- data.frame(
+  gene = names(gene_list),
+  rank = seq_along(gene_list),
+  value = gene_list
+)
+
+gene_rank$leading_edge <- gene_rank$gene %in% leading_edge_genes
+
+ggplot(gene_rank, aes(x = rank, y = value)) +
+  geom_line(color = "grey70") +
+  geom_point(
+    data = subset(gene_rank, leading_edge),
+    aes(x = rank, y = value),
+    color = "red",
+    size = 2
+  ) +
+  labs(
+    title = "Leading Edge Genes on Ranked List",
+    x = "Gene Rank",
+    y = "log2 Fold Change"
+  ) +
+  theme_minimal()
+
+ggsave("Mitophagy_LeadingEdge_overlay.pdf", width = 7, height = 5)
+
+
+```
+# Gene–pathway network plot
+
+```{R}
+library(enrichplot)
+
+p_net <- cnetplot(
+  gsea_res,
+  showCategory = "REACTOME_MITOPHAGY",
+  foldChange = gene_list
+)
+
+p_net
+
+ggsave("Mitophagy_network.pdf", plot = p_net, width = 8, height = 6)

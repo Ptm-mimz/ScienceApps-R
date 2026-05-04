@@ -29,7 +29,7 @@ library(viridis)
 library(rstatix)
 library(RColorBrewer)
 library(readr)
-n_threads <- 32
+n_threads <- 8
 
 ```
 
@@ -459,14 +459,14 @@ library(distops)
 
 # --- 2️⃣ User-adjustable parameters ---
 assay_name <- "tfmfeatures"        # assay name
-target_var <- "Disease"          # "Treatment" or "Disease"
-comparison_levels <- c("Healthy", "OA", "RA")   # groups to compare "cont", "MG","Healthy", "OA", "RA", "control", "IL1"
-feature_keyword <- "Intensity"              # e.g. "Intensity" or "" for all
+target_var <- "Treatment"          # "Treatment" or "Disease"
+comparison_levels <- c("control", "IL1")   # groups to compare "cont", "MG","Healthy", "OA", "RA", "control", "IL1"
+feature_keyword <- "Corr"              # e.g. "Intensity" or "" for all
 topN <- 10                         # number of features to plot
 vif_limit <- 10                    # VIF limit
 use_vif <- TRUE                    # ✅ toggle ON/OFF for VIF filtering
 set.seed(123)
-treatment_filter <- "control"
+treatment_filter <- NULL          # "control"
 
 # --- 3️⃣ Extract features + metadata ---
 features <- as.data.frame(t(assay(sce_aggr, assay_name)))     #sce_aggr
@@ -662,7 +662,7 @@ if (!is.null(best_X_reduced) && ncol(best_X_reduced) > 0) {
     x = reorder(Feature, MeanDecreaseAccuracy),
     y = MeanDecreaseAccuracy
   )) +
-    geom_bar(stat = "identity", fill = "maroon") +   #steelblue seagreen2 maroon
+    geom_bar(stat = "identity", fill = "steelblue") +   #steelblue seagreen2 maroon
     coord_flip() +
     theme_bw(base_size = 18) +
     labs(
@@ -969,16 +969,16 @@ heatmap_plot
      "Intensity_MeanIntensity_CorrEdU", 
    "Intensity_MeanIntensity_CorrLipid", 
    "Intensity_MeanIntensity_CorrMitosox" 
-     
+     "RadialDistribution_RadialCV_CorrBlue_4of4",
+    "Correlation_Costes_CorrBlue_CorrEdU",
+    "Intensity_StdIntensityEdge_CorrLipid"
 ## ===============================
 ## 1. Features and data prep
 ## ===============================
-my_features  <- c("Correlation_K_CorrMitosox_CorrLipid",
-                  "Correlation_K_CorrLipid_CorrMitosox",
-                  "Correlation_Costes_CorrLipid_CorrEdU",
-                  "Intensity_MaxIntensityEdge_CorrLipid",
-                  "Granularity_3_CorrLipid"
-                  )
+my_features  <- c("Intensity_IntegratedIntensity_CorrLipid",
+                  "Intensity_IntegratedIntensity_CorrMitosox",
+                  "Intensity_IntegratedIntensity_CorrEdU")
+
 
 all_features <- my_features
 
@@ -1001,9 +1001,9 @@ df_long <- df %>%
 ## ===============================
 ## 2. Global switches
 ## ===============================
-compare_mode      <- "treatment"   # "treatment" or "disease" (lowercase)
+compare_mode      <- "disease"   # "treatment" or "disease" (lowercase)
 diseases_to_plot  <- c("Healthy","OA", "RA")   #, "OA", "RA"
-treatments_to_plot<- c("control", "IL1")
+treatments_to_plot<- c("control")   #, "IL1"
 plot_per_patient  <- TRUE
 
 ## ===============================
@@ -1057,11 +1057,17 @@ df_plot_ready[[x_var]] <- factor(df_plot_ready[[x_var]], levels = levels_x)
     set2 <- brewer.pal(8, "Set2")
     set3 <- brewer.pal(12, "Set3")
 
-plot_colors <- c(
-  "control" = set2[6],    # your requested Set2 color 6
-  "IL1"     = set2[5]     # for PIC  "PIC"     = set3[5] 
-)
+# plot_colors <- c(
+#   "control" = set2[6],    # your requested Set2 color 6
+#   "IL1"     = set2[5]     # for PIC  "PIC"     = set3[5]
+# )
 
+# for disease compare
+plot_colors <- c(
+  "Healthy" = set3[3],
+  "OA"      = set3[4],
+  "RA"      = set3[5]
+)
 
 ## ===============================
 ## 5. Loop over features and plot
@@ -1113,63 +1119,77 @@ for (f in unique(df_plot_ready$Feature)) {
   }
 
   ## ---------- plot ----------
-  p <- ggplot(df_plot, aes_string(x = x_var, y = "Intensity", fill = x_var)) +
-    {
-      if (plot_per_patient) {
-        geom_point(
-          aes_string(color = x_var),
-          size = 3, alpha = 0.45,
-          position = position_jitter(width = 0.18)
-        )
-      } else {
-        geom_jitter(
-          aes_string(color = x_var),
-          size = 1, alpha = 0.35, width = 0.25
-        )
-      }
-    } +
-    geom_violin(
-      trim = FALSE, alpha = 0.65,
-      width = 0.9, color = "black", size = 0.9
-    ) +
-    geom_boxplot(
-      width = 0.12, outlier.shape = NA,
-      fill = "white", alpha = 0.4,
-      color = "black", size = 0.5
-    ) +
-    scale_fill_manual(values = plot_colors) +
-    scale_color_manual(values = plot_colors) +
-    labs(
-      title = paste("Feature:", f),
-      y     = "Z-scored log intensity",
-      x     = x_var
-    ) +
-    theme_bw(base_size = 18) +
-    theme(
-      plot.title  = element_text(size = 20, face = "bold", hjust = 0.5),
-      axis.title  = element_text(size = 18, face = "bold"),
-      axis.text.x = element_text(angle = 45, hjust = 1, size = 16),
-      panel.grid  = element_blank(),
-      strip.text  = element_text(size = 14, face = "bold")
-    ) +
-    {
-      if (!is.null(stat.test) && nrow(stat.test) > 0) {
-        stat_pvalue_manual(
-          stat.test,
-          label        = "p.signif",
-          size         = 5,
-          tip.length   = 0.01,
-          bracket.size = 0.6
-        )
-      }
-    } +
-    facet_wrap(as.formula(paste("~", facet_var)))
+ p <- ggplot(df_plot, aes_string(x = x_var, y = "Intensity", fill = x_var)) +
 
-  print(p)
-  ggsave(
-    file.path(outdir, paste0(gsub("[^A-Za-z0-9_]+", "_", f), ".pdf")),
-    p, width = 8, height = 6, dpi = 300
-  )
+  # violin + boxplot first
+  geom_violin(
+    trim = FALSE, alpha = 0.65,
+    width = 0.9, color = "black", size = 0.9
+  ) +
+  geom_boxplot(
+    width = 0.12, outlier.shape = NA,
+    fill = "white", alpha = 0.4,
+    color = "black", size = 0.5
+  ) +
+
+  # now add patient points on top
+  {
+    if (plot_per_patient) {
+      geom_point(
+        aes_string(color = NULL),  # ignore fill/color mapping
+        size = 3,
+        position = position_jitter(width = 0.18),
+        color = "black",
+        alpha = 0.6
+      )
+    } else {
+      geom_jitter(
+        aes_string(color = NULL),
+        size = 1,
+        width = 0.25,
+        color = "black",
+        alpha = 0.6
+      )
+    }
+  } +
+
+  # fill for violins only
+  scale_fill_manual(values = plot_colors) +
+
+  labs(
+    title = paste("Feature:", f),
+    y     = "Z-scored log intensity",
+    x     = x_var
+  ) +
+  theme_bw(base_size = 18) +
+  theme(
+    plot.title  = element_text(size = 20, face = "bold", hjust = 0.5),
+    axis.title  = element_text(size = 18, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 16),
+    panel.grid  = element_blank(),
+    strip.text  = element_text(size = 14, face = "bold")
+  ) +
+
+  # stat test if exists
+  {
+    if (!is.null(stat.test) && nrow(stat.test) > 0) {
+      stat_pvalue_manual(
+        stat.test,
+        label        = "p.signif",
+        size         = 5,
+        tip.length   = 0.01,
+        bracket.size = 0.6
+      )
+    }
+  } +
+
+  facet_wrap(as.formula(paste("~", facet_var)))
+
+print(p)
+ggsave(
+  file.path(outdir, paste0(gsub("[^A-Za-z0-9_]+", "_", f), ".pdf")),
+  p, width = 8, height = 6, dpi = 300
+)
 }
 
 
@@ -1772,12 +1792,13 @@ ft <- flextable(table_wide) %>%
     TNF = "TNF"
   ) %>%
   add_header_row(
-    values = c(" ", "Treatment (mean, SD, p, p-adj, significance)"),
+    values = c(" ", "Treatment (mean, SD, pvalue, significance)"),
     colwidths = c(1, ncol(table_wide) - 1)
   ) %>%
-  merge_v(j = c("Disease", "Feature")) %>%  # Merge same disease & same feature rows
+  merge_v(j = c("Disease", "Feature")) %>%
   bold(i = ~!is.na(Disease), j = "Disease") %>%
   theme_vanilla() %>%
+  font(fontname = "Arial", part = "all") %>%   # ← ADD THIS
   autofit() %>%
   align(align = "center", part = "header") %>%
   align(j = c("Disease","Feature"), align = "left", part = "body") %>%
@@ -1791,8 +1812,13 @@ doc <- body_add_flextable(doc, value = ft)
 print(doc, target = "MeanIntensity_table_merged.docx")
 
 
-# --- 4. Save as image (two-line layout) ---
-save_as_image(ft, path = "MeanIntensity_table_merged.png", zoom = 2)
+# --- 4. Save as pdf ---
+library(rmarkdown)
+
+rmarkdown::pandoc_convert(
+  input = "MeanIntensity_table_merged.docx",
+  output = "MeanIntensity_table_merged.pdf"
+)
 
 ````
 ## plot differences from control
@@ -1801,6 +1827,26 @@ save_as_image(ft, path = "MeanIntensity_table_merged.png", zoom = 2)
 
 # Combine both plates and compute difference from control per patient
 # (Assuming control treatment is named "Control" — change if needed)
+intensity_data <- as.data.frame(t(assay(sce_aggr, "tfmfeatures")))
+intensity_data <- intensity_data[, c("Intensity_MeanIntensity_CorrMitosox", 
+                                    "Intensity_MeanIntensity_CorrLipid", 
+                                    "Intensity_MeanIntensity_CorrEdU" )]
+
+metadata <- as.data.frame(colData(sce_aggr)[, c("Patient", "Treatment", "Disease", "Joint", "Plate")])
+df <- cbind(metadata, intensity_data)  # Replace with correct column names
+
+df_long <- pivot_longer(
+  df,
+  cols = starts_with("Intensity"),
+  names_to = "Feature",
+  values_to = "Intensity"
+)
+
+# Calculate mean per patient per condition
+df_summary <- df_long %>%
+  group_by(Patient, Treatment, Disease, Plate, Feature) %>%
+  summarise(MeanIntensity = mean(Intensity, na.rm = TRUE), .groups = "drop")
+
 
 control_label <- "control"
 #excluded_patient <- "TRA27"
@@ -3145,82 +3191,272 @@ ggsave(
   units = "in"
 )
 
+```
+
+# run LOO, plot volcano/function - save pdf
+
+```{r}
+# define new target
+target = "Disease"
+
+# set Healthy as reference level
+sce_aggr$Disease <- as.factor(sce_aggr$Disease)
+sce_aggr$Disease <- relevel(sce_aggr$Disease, ref = "Healthy") #Healthy
+
+# filter to control cells only and plate
+sce_aggr <- sce_aggr[, sce_aggr$Treatment == "control"]
+
+# comparison
+reference_level <- "Healthy"
+interest_levels <- setdiff(levels(sce_aggr$Disease), reference_level)
+
+# same across panels
+types <- c("AreaShape", "Intensity", "Texture", "RadialDistribution", 
+           "Granularity")
+
+# channels vary across panels
+channels <- c("CorrLipid", "CorrBlue", "CorrMitosox", "CorrEdU")
+
+
+# only run for "all" feature
+sce_oa <- predictLOO(
+  sce_aggr, 
+  target = target,
+  interest_level = "OA", reference_level = "Healthy",
+  types = NULL, channels = channels,
+  n_threads = n_threads
+  )
+
+# compare RA vs Healthy
+sce_ra <- predictLOO(
+  sce_aggr, 
+  target = target,
+  interest_level = "RA", reference_level = "Healthy",
+  types = NULL, channels = channels,
+  n_threads = n_threads
+  )
+
+# compare OA vs RA
+sce_oara <- predictLOO(
+  sce_aggr, 
+  target = target,
+  interest_level = "RA", reference_level = "OA",
+  types = NULL, channels = channels,
+  n_threads = n_threads
+  )
+
+# Your custom theme (you already have this)
+theme_pub <- theme_bw(base_size = 18) +
+  theme(
+    plot.title   = element_text(face = "bold", hjust = 0.5),
+    axis.title   = element_text(face = "bold"),
+    panel.grid   = element_blank(),
+    # Optional extras for clean pub style
+    axis.line    = element_line(color = "black"),
+    strip.text   = element_text(face = "bold"),
+    legend.title = element_text(face = "bold")
+  )
+
+# Fix axis for volcano
+scale_x_custom <- scale_x_continuous(
+  limits = c(0, 2.5),
+  breaks = seq(0, 2.5, by = 0.5),
+  expand = c(0, 0),
+  name   = "log2 Fold Change"   # adjust label if needed
+)
+
+scale_y_custom <- scale_y_continuous(
+  limits = c(0, 8),
+  breaks = seq(0, 8, by = 1),
+  expand = c(0, 0),
+  name   = "-log10(adjusted p-value)"
+)
+
+meta_vars <- c("Patient", "Disease", "Plate")
+n_tests <- length(types)+length(channels)
+
+# ────────────────────────────────────────────────────────────────
+# Plot volcano + theme
+# ────────────────────────────────────────────────────────────────
+
+reference_level <- "Healthy"
+
+p <- volcanoPlot(
+  sce_oa,
+  p_cutoff = 0.05/n_tests,
+  fc_cutoff = 0.5,
+  meta_vars = meta_vars,
+  target = target
+) + theme_pub + scale_x_custom + scale_y_custom + ggtitle("Volcano_OA_vs_Healthy")
+
+ggsave("Volcano_OA_vs_healthy.pdf", p, width = 6, height = 5)
+
+#--------------
+
+reference_level <- "Healthy"
+
+p2 <- volcanoPlot(
+  sce_ra,
+  p_cutoff = 0.05/n_tests,
+  fc_cutoff = 0.5,
+  meta_vars = meta_vars,
+  target = target
+) + theme_pub + scale_x_custom + scale_y_custom  + ggtitle("Volcano_RA_vs_Healthy")
+
+ggsave("Volcano_RA_vs_healthy.pdf", p2, width = 6, height = 5)
+
+#------------
+
+reference_level <- "OA"
+
+p3 <- volcanoPlot(
+  sce_oara,
+  p_cutoff = 0.05/n_tests,
+  fc_cutoff = 0.5,
+  meta_vars = meta_vars,
+  target = target
+) + theme_pub + scale_x_custom + scale_y_custom  + ggtitle("Volcano_OA_vs_RA")
+
+ggsave("Volcano_RA_vs_OA.pdf", p3, width = 6, height = 5)
+
 ````
-#compare joint differences
+# Pre-validation analysis
+Predict Treatment
 
-````{r}
+```{r}
+target = "Treatment"
 
-##only work for Joint that has in at least 2 diseases
-sce_cont <- sce[, sce$Treatment == "control"]
- 
-#1
-result <- fitModel(sce_cont,
-                   target = "Joint", 
-                   interest_level = "wrist", reference_level = "mcp", 
-                   group = "Patient", strata = "Disease",
-                   n_folds = 5, n_threads = 8)  #only work with 5 folds-> low sample
-
-plotROC(result)
-
-### can't do per function analysis error; No event observations were detected in `truth` with event level 'mcp'.
-
-#2
-result <- fitModel(sce_cont,
-                   target = "Joint", 
-                   interest_level = "shoulder", reference_level = "knee", 
-                   group = "Patient", strata = "Disease",
-                   n_folds = 10, n_threads = 8)
+# set Healthy as reference level
+sce_aggr$Treatment <- as.factor(sce_aggr$Treatment)
+sce_aggr$Treatment <- relevel(sce_aggr$Treatment, ref = "control") 
 
 
-plotROC(result)
+# filter to RA cells only 
+sce_aggr <- sce_aggr[, sce_aggr$Disease == "RA"]
 
-##only one function at a time
-
-sce_select <- sce[str_detect(names(sce), "Texture|Intensity|AreaShape"), ]
-
-sce_select <- sce_select[
-  str_detect(rownames(sce_select), "CorrLipid"),  #CorrMitosox, CorrEdU,CorrLipid
-  ]  
-sce_cont <- sce_select[, sce_select$Treatment == "control"]
-
-rownames(sce_select)
-
-result <- fitModel(sce_cont,
-                   target = "Joint", 
-                   interest_level = "shoulder", reference_level = "knee", 
-                   group = "Patient", strata = "Disease",
-                   n_folds = 5, n_threads = 8)
-
-plotROC(result)
-
-#3
-result <- fitModel(sce_cont,
-                   target = "Joint", 
-                   interest_level = "wrist", reference_level = "knee", 
-                   group = "Patient", strata = "Disease",
-                   n_folds = 5, n_threads = 8)
+# comparison
+reference_level <- "control"   
+interest_levels <- setdiff(levels(sce_aggr$Treatment), reference_level)
 
 
-plotROC(result)
+types <- c("AreaShape", "Intensity", "Texture", "RadialDistribution", "Granularity")
 
-##only one function at a time
+# channels
+channels <- c("CorrLipid", "CorrBlue", "CorrMitosox", "CorrEdU")
 
-sce_select <- sce[str_detect(names(sce), "Texture|Intensity|AreaShape"), ]
+sce_aggr$Treatment <- factor(sce_aggr$Treatment)
+sce_aggr$Treatment <- relevel(sce_aggr$Treatment, ref = "control")
 
-sce_select <- sce_select[
-  str_detect(rownames(sce_select), "CorrEdU"),  #CorrMitosox, CorrEdU,CorrLipid
-  ]  
-sce_cont <- sce_select[, sce_select$Treatment == "control"]
+res_IL1 <- predictLOO(
+  sce_aggr,
+  interest_level = "IL1",
+  reference_level = "control",
+  types = NULL,
+  channels = channels,
+  n_threads = n_threads
+)
 
-rownames(sce_select)
+# downstream plotting
+n_tests <- length(types)+length(channels)
+meta_vars = c("Patient", "Disease", "Plate", "Treatment")
+plotLOO(res_IL1, meta_vars = meta_vars, target = target)
+plotROC(res_IL1, meta_vars = meta_vars, target = target)
+plotAUC(res_IL1, meta_vars = meta_vars, target = target)  #, batch = "Plate"
+volcanoPlot(res_IL1, p_cutoff = 0.05/n_tests, fc_cutoff = 0.5,
+            meta_vars = meta_vars, target = target)
 
-result <- fitModel(sce_cont,
-                   target = "Joint", 
-                   interest_level = "wrist", reference_level = "knee", 
-                   group = "Patient", strata = "Disease",
-                   n_folds = 5, n_threads = 8)
+#------generate plot---------------
+sce_il1 <- res_IL1
 
-plotROC(result)
+meta_vars <- c("Patient", "Disease", "Plate", "Treatment")
+target <- "Treatment"
+
+p_loo_il1 <- plotLOO(sce_il1, meta_vars = meta_vars, target = target)
+p_roc_il1 <- plotROC(sce_il1, meta_vars = meta_vars, target = target)
+p_auc_il1 <- plotAUC(sce_il1, meta_vars = meta_vars, target = target)
+
+theme_pub <- theme_bw(base_size = 18) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    panel.grid = element_blank()
+  )
+
+scale_y_01 <- scale_y_continuous(
+  limits = c(0, 1),
+  breaks = seq(0, 1, 0.2),
+  expand = c(0, 0)
+)
+
+p_loo_il1 <- p_loo_il1 + theme_pub 
+p_roc_il1 <- p_roc_il1 + theme_pub 
+p_auc_il1 <- p_auc_il1 + theme_pub 
+
+dir.create("Publication_Plots", showWarnings = FALSE)
+
+# PDF (vector)
+ggsave("Publication_Plots/LOO_IL1_vs_Control.pdf", p_loo_il1, width = 8, height = 6)
+
+# PNG (slides)
+ggsave("Publication_Plots/LOO_IL1_vs_Control.png", p_loo_il1, width = 8, height = 6)
+ggsave("Publication_Plots/ROC_IL1_vs_Control.png", p_roc_il1, width = 8, height = 6)
+ggsave("Publication_Plots/AUC_IL1_vs_Control.png", p_auc_il1, width = 8, height = 6)
+
+
+#-----Volcano plot--------------
+
+# Your custom theme (you already have this)
+theme_pub <- theme_bw(base_size = 18) +
+  theme(
+    plot.title   = element_text(face = "bold", hjust = 0.5),
+    axis.title   = element_text(face = "bold"),
+    panel.grid   = element_blank(),
+    # Optional extras for clean pub style
+    axis.line    = element_line(color = "black"),
+    strip.text   = element_text(face = "bold"),
+    legend.title = element_text(face = "bold")
+  )
+
+# Fix axis for volcano
+scale_x_custom <- scale_x_continuous(
+  limits = c(0, 2.5),
+  breaks = seq(0, 2.5, by = 0.5),
+  expand = c(0, 0),
+  name   = "log2 Fold Change"   # adjust label if needed
+)
+
+scale_y_custom <- scale_y_continuous(
+  limits = c(0, 8),
+  breaks = seq(0, 8, by = 1),
+  expand = c(0, 0),
+  name   = "-log10(adjusted p-value)"
+)
+
+
+# ────────────────────────────────────────────────────────────────
+# Plot volcano + theme
+# ────────────────────────────────────────────────────────────────
+
+
+p <- volcanoPlot(res_IL1, p_cutoff = 0.05/n_tests, fc_cutoff = 0.5,
+            meta_vars = meta_vars, target = target) + 
+            theme_pub + scale_x_custom + scale_y_custom + ggtitle("Volcano_control_vs_IL1")
+
+ggsave(
+  filename = "Volcano_control_vs_IL1.pdf",
+  plot = p,
+  width = 6,
+  height = 5,
+  device = cairo_pdf
+)
+
+ggsave(
+  filename = "Volcano_control_vs_IL1.png",
+  plot = p,
+  width = 6,
+  height = 5,
+  dpi = 300
+)
 
 
 ```
