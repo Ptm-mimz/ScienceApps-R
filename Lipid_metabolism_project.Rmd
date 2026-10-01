@@ -1,0 +1,1867 @@
+---
+title: "Lipid metabolism project"
+author: "Phatthamon"
+date: 15/9/2026
+format: html
+editor: source
+embed-resources: true
+---
+
+## Load Data
+
+```{r}
+library(cellpaintr)
+library(ggplot2)
+library(scater)
+library(scran)
+library(bluster)
+library(stringr)
+library(dplyr)
+library(batchelor)
+library(BiocParallel)
+library(tidyr)
+library(MultiAssayExperiment)
+library(lme4)
+library(lmerTest)
+library(ggrepel)
+library(ggpubr)
+library(viridis)
+library(rstatix)
+library(RColorBrewer)
+library(pracma)
+
+n_threads <- 8
+
+```
+
+Path to files.
+
+```{r}
+# path to files
+base <- paste0("/shares/rheumatologie.usz/mimzzzzzzzz/")
+
+files_stress <- c(
+  paste0(base, "260915-PLIN2/MyExpt_Cells.csv")
+  )
+sce <- Reduce(cbind, lapply(files_stress, loadData))
+
+#for lipophagy
+base <- paste0("/shares/rheumatologie.usz/mimzzzzzzzz/")
+
+files_stress <- c(
+  paste0(base, "260917-Lipophagy_CD/MyExpt_Cells.csv")
+  )
+sce <- Reduce(cbind, lapply(files_stress, loadData))
+
+# for C75
+base <- paste0("/shares/rheumatologie.usz/mimzzzzzzzz/")
+
+files_stress <- c(
+  paste0(base, "260925_C75_cytokines/MyExpt_Cells.csv"))
+sce <- Reduce(cbind, lapply(files_stress, loadData))
+
+```
+Data transformation
+
+```{r}
+# remove cells with missing features
+sce <- removeNAs(sce)
+
+# remove outlier images
+sce <- removeOutliers(sce, min = 1, max = 300)
+
+# remove outlier cells
+stats <- perCellQCMetrics(sce, assay.type = "features")
+sce <- sce[, !isOutlier(stats$sum)]
+
+# remove features with zero spread
+sce <- removeLowVariance(sce, robust = TRUE)
+
+# remove zero-inflated features
+sce <- removeZeroInflation(sce)
+
+# transform, center, and scale features
+sce <- transformScale(sce, robust = TRUE)
+
+# number of cells
+plotCellsPerImage(sce)
+
+```
+Pseudo-bulk over images.
+
+```{r}
+
+sce_aggr <- aggregateAcrossCells(
+  sce,
+  id = colData(sce)[, c("ImageNumber", "Well", "Patient", "Disease")],   
+  use.assay.type = "tfmfeatures",
+  statistics = "mean"
+  )
+
+sce_aggr <- aggregateAcrossCells(
+  sce,
+  id = colData(sce)[, c("ImageNumber", "Well", "Patient", "Disease", "C75", "Cytokine")],   
+  use.assay.type = "tfmfeatures",
+  statistics = "mean"
+  )
+
+
+```
+
+#single cell plot / per patient for feature - violin - 1 treatment vs control
+
+```{r}
+## ============================================================
+## 1. Select features
+## ============================================================
+
+all_feature_names <- rownames(
+  assay(sce_aggr, "tfmfeatures")
+)
+
+my_features <- all_feature_names[
+  grepl("PLIN", all_feature_names, ignore.case = TRUE) &            #PLIN
+  (
+    grepl("MaxIntensityEdge", all_feature_names, ignore.case = TRUE) |
+    grepl("RadialDistribution.*3of4", all_feature_names, ignore.case = TRUE) |
+    grepl("Granularity_3", all_feature_names, ignore.case = TRUE) |
+    grepl("MeanIntensity", all_feature_names, ignore.case = TRUE) |
+    grepl("IntegratedIntensity", all_feature_names, ignore.case = TRUE) |
+      grepl("RWC", all_feature_names, ignore.case = TRUE) |
+    grepl("MassDisplacement", all_feature_names, ignore.case = TRUE) 
+  )
+]
+
+cat("Selected features:\n")
+print(my_features)
+
+all_features <- my_features
+
+
+## ============================================================
+## 2. Choose plotting level
+## ============================================================
+
+plot_level <- "cell"
+# "cell"    = plot individual cells
+# "patient" = average cells within each Patient x Treatment
+treatment_to_plot <- "TGFb"
+
+## ============================================================
+## 3. Extract feature data
+## ============================================================
+
+feature_data <- as.data.frame(
+  t(assay(sce_aggr, "tfmfeatures"))
+)
+
+feature_data <- feature_data[
+  ,
+  all_features,
+  drop = FALSE
+]
+
+
+## ============================================================
+## 4. Extract metadata
+## ============================================================
+
+metadata <- as.data.frame(
+  colData(sce_aggr)[,
+    c(
+      "Well",
+      "Patient",
+      "Treatment"    #,
+      #"Disease"
+    )
+  ]
+)
+
+
+## ============================================================
+## 5. Combine metadata + features
+## ============================================================
+
+df <- cbind(
+  metadata,
+  feature_data
+)
+
+
+## ============================================================
+## 6. Convert to long format
+## ============================================================
+
+df_long <- df %>%
+  pivot_longer(
+    cols = all_of(all_features),
+    names_to = "Feature",
+    values_to = "Intensity"
+  )
+
+
+## ============================================================
+## 7. Select the main experiment
+##
+## Condition = NA means:
+## keep wells that are NOT labelled as "test"
+## ============================================================
+
+df_plot_ready <- df_long %>%
+  filter(
+    #is.na(Condition),
+    Treatment %in% c("control", treatment_to_plot)
+  )
+
+
+## ============================================================
+## 8. Patient-level aggregation
+## ============================================================
+
+if (plot_level == "patient") {
+
+  df_plot_ready <- df_plot_ready %>%
+    group_by(
+      Patient,
+      Treatment,
+      Feature
+    ) %>%
+    summarise(
+      Intensity = mean(
+        Intensity,
+        na.rm = TRUE
+      ),
+      .groups = "drop"
+    )
+}
+
+
+## ============================================================
+## 9. Treatment order
+## ============================================================
+
+df_plot_ready$Treatment <- factor(
+  df_plot_ready$Treatment,
+  levels = c(
+    "control",
+    treatment_to_plot
+  )
+)
+
+
+## ============================================================
+## 10. Colors
+## ============================================================
+
+plot_colors <- c(
+  "control" = "#FFD966",   # brighter yellow
+   "IL1"     = "#70AD47",  # green
+  "TNF"     = "#5B9BD5",  # blue
+  "IFNa"    = "#ED7D31",  # orange
+  "LPS"     = "#A64D79",  # purple
+  "IL6"     = "#00A6A6",  # teal
+  "TGFb"    = "#C55A11"   # dark orange
+)
+
+## ============================================================
+## 11. Output directory
+## ============================================================
+
+outdir <- paste0(
+  "Flexible_Plots_PLIN_",
+  plot_level
+)
+
+dir.create(
+  outdir,
+  showWarnings = FALSE
+)
+
+
+## ============================================================
+## 12. Loop over features
+## ============================================================
+
+for (f in unique(df_plot_ready$Feature)) {
+
+  df_plot <- df_plot_ready %>%
+    filter(
+      Feature == f
+    )
+
+
+  ## ==========================================================
+  ## 13. Statistics
+  ## ==========================================================
+
+  if (plot_level == "patient") {
+
+    # ---------------------------------------------------------
+    # Paired Wilcoxon test
+    # Each Patient has control + IL1
+    # ---------------------------------------------------------
+
+    stat_result <- df_plot %>%
+      pairwise_wilcox_test(
+        Intensity ~ Treatment,
+        paired = TRUE,
+        p.adjust.method = "none"
+      )
+
+  } else {
+
+    # ---------------------------------------------------------
+    # Cell-level Wilcoxon test
+    # ---------------------------------------------------------
+
+    stat_result <- df_plot %>%
+      pairwise_wilcox_test(
+        Intensity ~ Treatment,
+        p.adjust.method = "none"
+      )
+  }
+
+
+  ## ==========================================================
+  ## 14. P-value position
+  ## ==========================================================
+
+  stat.test <- NULL
+
+  if (nrow(stat_result) > 0) {
+
+    stat.test <- stat_result %>%
+      add_xy_position(
+        fun = "max",
+        x = "Treatment",
+        step.increase = 0.15
+      ) %>%
+      mutate(
+        p.signif = case_when(
+          p <= 0.001 ~ "***",
+          p <= 0.01  ~ "**",
+          p <= 0.05  ~ "*",
+          TRUE       ~ paste0(
+            "p = ",
+            signif(p, 2)
+          )
+        )
+      )
+  }
+
+
+  ## ==========================================================
+  ## 15. Plot
+  ## ==========================================================
+
+  p <- ggplot(
+    df_plot,
+    aes(
+      x = Treatment,
+      y = Intensity,
+      fill = Treatment
+    )
+  ) +
+
+    ## Violin
+    geom_violin(
+      trim = FALSE,
+      alpha = 0.65,
+      width = 0.9,
+      color = "black",
+      linewidth = 0.9
+    ) +
+
+    ## Boxplot
+    geom_boxplot(
+      width = 0.12,
+      outlier.shape = NA,
+      fill = "white",
+      alpha = 0.4,
+      color = "black",
+      linewidth = 0.5
+    ) +
+
+    ## Individual observations
+    geom_jitter(
+  aes(
+    fill = Treatment
+  ),
+  shape = 21,
+  color = "black",
+  stroke = 0.7,
+  width = ifelse(
+    plot_level == "patient",
+    0.10,
+    0.25
+  ),
+  size = ifelse(
+    plot_level == "patient",
+    3.2,
+    1.8
+  ),
+  alpha = 0.9
+) +
+
+    ## Colors
+    scale_fill_manual(
+      values = plot_colors
+    ) +
+
+    scale_color_manual(
+      values = plot_colors
+    ) +
+
+    ## Labels
+    labs(
+      title = f,
+      y = "Z-scored log intensity",
+      x = "Treatment"
+    ) +
+
+    ## Theme
+    theme_bw(
+      base_size = 18
+    ) +
+
+    theme(
+      plot.title = element_text(
+        size = 16,
+        face = "bold",
+        hjust = 0.5
+      ),
+      axis.title = element_text(
+        size = 18,
+        face = "bold"
+      ),
+      axis.text.x = element_text(
+        size = 16
+      ),
+      panel.grid = element_blank()
+    ) +
+
+    ## Statistics
+    {
+      if (
+        !is.null(stat.test) &&
+        nrow(stat.test) > 0
+      ) {
+
+        stat_pvalue_manual(
+          stat.test,
+          label = "p.signif",
+          size = 5,
+          tip.length = 0.01,
+          bracket.size = 0.6
+        )
+      }
+    }
+
+
+  ## ==========================================================
+  ## 16. Print
+  ## ==========================================================
+
+  print(p)
+
+
+  ## ==========================================================
+  ## 17. Save
+  ## ==========================================================
+
+  ggsave(
+    file.path(
+      outdir,
+      paste0(
+        gsub(
+          "[^A-Za-z0-9_]+",
+          "_",
+          f
+        ),
+        ".pdf"
+      )
+    ),
+    p,
+    width = 6,
+    height = 6,
+    dpi = 300
+  )
+}
+```
+
+#single cell plot/per patient - violin - Lipophagy - compare treatment&disease
+
+```{r}
+## ============================================================
+## 1. Select features
+## ============================================================
+
+all_feature_names <- rownames(
+  assay(sce_aggr, "tfmfeatures")
+)
+
+my_features <- all_feature_names[
+  grepl("Lipid", all_feature_names, ignore.case = TRUE) &            
+  (
+    grepl("MaxIntensityEdge", all_feature_names, ignore.case = TRUE) |
+    grepl("RadialDistribution.*3of4", all_feature_names, ignore.case = TRUE) |
+    grepl("Granularity_3", all_feature_names, ignore.case = TRUE) |
+    grepl("MeanIntensity", all_feature_names, ignore.case = TRUE) |
+    grepl("IntegratedIntensity", all_feature_names, ignore.case = TRUE) |
+      grepl("RWC", all_feature_names, ignore.case = TRUE) |
+    grepl("MassDisplacement", all_feature_names, ignore.case = TRUE) 
+  )
+]
+
+cat("Selected features:\n")
+print(my_features)
+
+all_features <- my_features
+
+
+## ============================================================
+## 2. Choose plotting level
+## ============================================================
+
+plot_level <- "cell"
+# "cell"    = plot individual cells
+# "patient" = average cells within each Patient x Treatment
+treatment_to_plot <- c("control", "IL1", "IL6", "TGFb")
+diseases_to_plot <- c("OA","RA")
+
+## ============================================================
+## 3. Extract feature data
+## ============================================================
+
+feature_data <- as.data.frame(
+  t(assay(sce_aggr, "tfmfeatures"))
+)
+
+feature_data <- feature_data[
+  ,
+  all_features,
+  drop = FALSE
+]
+
+
+## ============================================================
+## 4. Extract metadata
+## ============================================================
+
+metadata <- as.data.frame(
+  colData(sce_aggr)[,
+    c(
+      "Well",
+      "Patient",
+      "Treatment",
+      "Disease"
+    )
+  ]
+)
+
+
+## ============================================================
+## 5. Combine metadata + features
+## ============================================================
+
+df <- cbind(
+  metadata,
+  feature_data
+)
+
+
+## ============================================================
+## 6. Convert to long format
+## ============================================================
+
+df_long <- df %>%
+  pivot_longer(
+    cols = all_of(all_features),
+    names_to = "Feature",
+    values_to = "Intensity"
+  )
+
+
+## ============================================================
+## 7. Select the main experiment
+## ============================================================
+
+df_plot_ready <- df_long %>%
+  filter(
+    Treatment %in% treatment_to_plot,
+    Disease %in% c("OA", "RA")
+  )
+
+## ============================================================
+## 8. Patient-level aggregation
+## ============================================================
+
+if (plot_level == "patient") {
+
+  df_plot_ready <- df_plot_ready %>%
+    group_by(
+      Patient,
+      Disease,
+      Treatment,
+      Feature
+    ) %>%
+    summarise(
+      Intensity = mean(
+        Intensity,
+        na.rm = TRUE
+      ),
+      .groups = "drop"
+    )
+}
+
+## ============================================================
+## 9. Treatment order
+## ============================================================
+
+df_plot_ready$Treatment <- factor(
+  df_plot_ready$Treatment,
+  levels = treatment_to_plot
+)
+
+df_plot_ready$Disease <- factor(
+  df_plot_ready$Disease,
+  levels = c(
+    "OA",
+    "RA"
+  )
+)
+
+## ============================================================
+## 10. Colors
+## ============================================================
+
+plot_colors <- c(
+  "control" = "#FFD966",   # brighter yellow
+   "IL1"     = "#70AD47",  # green
+  "TNF"     = "#5B9BD5",  # blue
+  "IFNa"    = "#ED7D31",  # orange
+  "LPS"     = "#A64D79",  # purple
+  "IL6"     = "#00A6A6",  # teal
+  "TGFb"    = "#C55A11"   # dark orange
+)
+disease_colors <- c(
+  "OA" = "#A64D79",
+  "RA" = "#5B9BD5"
+)
+## ============================================================
+## 11. Output directory
+## ============================================================
+
+outdir <- paste0(
+  "Flexible_Plots_Lipid_",
+  plot_level
+)
+
+dir.create(
+  outdir,
+  showWarnings = FALSE
+)
+
+
+## ============================================================
+## 12. Loop over features
+## ============================================================
+for (f in unique(df_plot_ready$Feature)) {
+
+  ## ==========================================================
+  ## 1. Data for this feature
+  ## ==========================================================
+
+  df_plot <- df_plot_ready %>%
+    filter(
+      Feature == f
+    )
+
+
+  ## ==========================================================
+  ## 2. Statistics: OA vs RA within each treatment
+  ## ==========================================================
+
+stat_result <- df_plot %>% group_by(Disease) %>% 
+  pairwise_wilcox_test( Intensity ~ Treatment, 
+                        paired = FALSE, p.adjust.method = "none" )
+
+  ## ==========================================================
+  ## 3. P-value formatting
+  ## ==========================================================
+
+ stat.test <- stat_result %>% 
+   mutate( p.signif = case_when( 
+     p <= 0.001 ~ "***", 
+     p <= 0.01 ~ "**", 
+     p <= 0.05 ~ "*", 
+     TRUE ~ paste0( "p = ", signif(p, 2) ) ) )
+
+# Get maximum value for each disease 
+ y_max <- df_plot %>% group_by(Disease) %>% 
+   summarise( ymax = max( Intensity, na.rm = TRUE ), .groups = "drop" ) 
+ 
+ # Add y positions 
+ stat.test <- stat.test %>% left_join( y_max, by = "Disease" ) %>% 
+   group_by(Disease) %>% mutate( y.position = ymax + row_number() * 0.3 ) %>% ungroup()
+ 
+  ## ==========================================================
+  ## 4. Plot
+  ## ==========================================================
+
+ p <- ggplot( df_plot, aes( x = Treatment, y = Intensity, fill = Treatment ) ) + 
+   ## Violin 
+   geom_violin( trim = FALSE, alpha = 0.65, width = 0.8, color = "black", linewidth = 0.8 ) + 
+   
+   ## Individual observations
+   geom_jitter( aes( fill = Treatment ), width = 0.12, shape = 21, color = "black", 
+                stroke = 0.6, size = ifelse( plot_level == "patient", 3.2, 1.8 ), alpha = 0.9 ) + 
+   
+   ## Treatment colors
+   scale_fill_manual( values = plot_colors ) + 
+   
+   ## Facet by disease 
+   facet_wrap( ~ Disease ) + 
+   
+   ## Labels 
+   labs( title = f, y = "Z-scored log intensity", x = "Treatment", fill = "Treatment" ) + 
+   
+   ## Theme
+   theme_bw( base_size = 18 ) + theme( plot.title = element_text( size = 16, face = "bold", hjust = 0.5 ), 
+                                       axis.title = element_text( size = 18, face = "bold" ), 
+                                       axis.text.x = element_text( size = 16, angle = 45, hjust = 1 ), 
+                                       strip.text = element_text( size = 18, face = "bold" ), panel.grid = element_blank() ) 
+ 
+ ## ========================================================== 
+ ## 5. Add statistics 
+ ## ========================================================== 
+ if ( !is.null(stat.test) && nrow(stat.test) > 0 ) 
+ { p <- p + stat_pvalue_manual( stat.test, label = "p.signif", 
+                                  size = 5, tip.length = 0.01, bracket.size = 0.6 ) } 
+ 
+ ## ========================================================== 
+ ## 6. Print 
+ ## ========================================================== 
+ print(p) 
+ 
+ ## ========================================================== 
+ ## 7. Save 
+ ## ========================================================== 
+ ggsave( file.path( outdir, paste0( gsub( "[^A-Za-z0-9_]+", "_", f ), ".pdf" ) ), p, width = 10, height = 6, dpi = 300 ) 
+ }
+
+```
+
+#correlation plot
+
+```{r}
+
+intensity_data <- as.data.frame(t(assay(sce, "tfmfeatures")))
+intensity_features <- c(
+  "Intensity_MeanIntensity_CorrLipid", 
+  "Intensity_MeanIntensity_CorrLyso", 
+  "Intensity_IntegratedIntensity_CorrLipid",
+  "Intensity_IntegratedIntensity_CorrLyso"
+)
+intensity_data <- intensity_data[, intensity_features, drop = FALSE]
+
+metadata <- as.data.frame(colData(sce)[, c("Patient", "Treatment", "Disease", "Joint", "Plate")])
+df <- cbind(metadata, intensity_data)
+
+df_corr <- df %>%
+  filter(Disease == "healthy") %>%
+  filter(Treatment %in% c("cont", "R+C")) %>%  # <--- keep only these two groups
+  select(Treatment, Intensity_MeanIntensity_CorrCytoID, Intensity_MeanIntensity_CorrLyso)
+
+set2_colors <- RColorBrewer::brewer.pal(n = length(unique(df_corr$Treatment)), name = "Set2")
+
+custom_colors <- c("cont" = set2_colors[1], "R+C" = set2_colors[3])
+
+# --- Scatter plot with correlation test ---
+p_corr <- ggpubr::ggscatter(
+  df_corr,
+  x = "Intensity_MeanIntensity_CorrCytoID",
+  y = "Intensity_MeanIntensity_CorrLyso",
+  color = "Treatment",
+  palette = custom_colors,
+  add = "reg.line",
+  conf.int = TRUE,
+  cor.coef = TRUE,
+  cor.method = "spearman",
+  add.params = list(color = "gray30", fill = "lightgray"),
+  cor.coef.size = 6,   # Increase font size of correlation text
+  cor.coeff.args = list(
+    label.x.npc = "center",  # Horizontal position ("left", "center", or "right")
+    label.y.npc = "top",  # Vertical position ("bottom", "center", or "top")
+    color = "black",         # Optional: set color of correlation label
+    fontface = "bold"        # Optional: make it bold
+  ),
+  xlab = "Mean Intensity (CytoID)",
+  ylab = "Mean Intensity (Lyso)",
+  title = "Correlation between CytoID and Lyso intensities (Healthy)"
+) +
+  facet_wrap(~Treatment) +
+  theme_bw(base_size = 16) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    axis.title = element_text(face = "bold", size = 16),
+    legend.position = "right"
+  )
+
+print(p_corr)
+
+ggsave(
+  filename = "Correlation_CytoID_Lyso_Healthy.pdf",
+  plot = p_corr,
+  width = 8,
+  height = 6,
+  units = "in"
+)
+
+```
+# for C75 experiment
+
+```{r}
+## ============================================================
+## 1. Select lipid features
+## ============================================================
+
+all_feature_names <- rownames(
+  assay(sce_aggr, "tfmfeatures")
+)
+
+my_features <- all_feature_names[
+  grepl("EdU", all_feature_names, ignore.case = TRUE) &
+    (
+      grepl("MeanIntensity", all_feature_names, ignore.case = TRUE) |
+         #grepl("MaxIntensity", all_feature_names, ignore.case = TRUE) |
+      grepl("IntegratedIntensity", all_feature_names, ignore.case = TRUE)
+    )
+]
+
+cat("Selected features:\n")
+print(my_features)
+
+all_features <- my_features
+
+
+## ============================================================
+## 2. Choose plotting level
+## ============================================================
+
+plot_level <- "patient"
+
+cytokines_to_plot <- c(
+  "control",
+  "IL1",
+  "IL6",
+  "TGFb"
+)
+# "IL1",
+#   "IL6",
+#   
+
+diseases_to_plot <- c(
+  "OA",
+  "RA"
+)
+
+c75_levels <- c(
+  "0",
+  "1",
+  "10"
+)
+
+
+## ============================================================
+## 3. Extract feature data
+## ============================================================
+
+feature_data <- as.data.frame(
+  t(assay(sce_aggr, "tfmfeatures"))
+)
+
+feature_data <- feature_data[
+  ,
+  all_features,
+  drop = FALSE
+]
+
+
+## ============================================================
+## 4. Extract metadata
+## ============================================================
+
+metadata <- as.data.frame(
+  colData(sce_aggr)[,
+    c(
+      "Well",
+      "Patient",
+      "Cytokine",
+      "C75",
+      "Disease"
+    )
+  ]
+)
+
+
+## ============================================================
+## 5. Combine metadata + features
+## ============================================================
+
+df <- cbind(
+  metadata,
+  feature_data
+)
+
+
+## ============================================================
+## 6. Convert to long format
+## ============================================================
+
+df_long <- df %>%
+  pivot_longer(
+    cols = all_of(all_features),
+    names_to = "Feature",
+    values_to = "Intensity"
+  )
+
+
+## ============================================================
+## 7. Select experiment
+## ============================================================
+
+df_plot_ready <- df_long %>%
+  filter(
+    Cytokine %in% cytokines_to_plot,
+    Disease %in% diseases_to_plot,
+    as.character(C75) %in% c75_levels
+  )
+
+
+## ============================================================
+## 8. Patient-level aggregation
+## ============================================================
+
+if (plot_level == "patient") {
+
+  df_plot_ready <- df_plot_ready %>%
+    group_by(
+      Patient,
+      Disease,
+      Cytokine,
+      C75,                 
+      Feature
+    ) %>%
+    summarise(
+      Intensity = mean(
+        Intensity,
+        na.rm = TRUE
+      ),
+      .groups = "drop"
+    )
+}
+
+
+## ============================================================
+## 9. Factor order
+## ============================================================
+
+df_plot_ready$Cytokine <- factor(
+  df_plot_ready$Cytokine,
+  levels = cytokines_to_plot
+)
+
+df_plot_ready$C75 <- factor(
+  as.character(df_plot_ready$C75),
+  levels = c75_levels
+)
+
+df_plot_ready$Disease <- factor(
+  df_plot_ready$Disease,
+  levels = diseases_to_plot
+)
+
+
+## ============================================================
+## 10. Check the data before plotting
+## ============================================================
+
+cat("\nNumber of rows:", nrow(df_plot_ready), "\n")
+
+cat("\nCytokine:\n")
+print(table(df_plot_ready$Cytokine, useNA = "ifany"))
+
+cat("\nC75:\n")
+print(table(df_plot_ready$C75, useNA = "ifany"))
+
+cat("\nDisease:\n")
+print(table(df_plot_ready$Disease, useNA = "ifany"))
+
+cat("\nPatient × Cytokine × C75:\n")
+
+print(
+  df_plot_ready %>%
+    distinct(
+      Patient,
+      Disease,
+      Cytokine,
+      C75
+    ) %>%
+    count(
+      Disease,
+      Cytokine,
+      C75
+    )
+)
+
+
+## ============================================================
+## 11. Colors
+## ============================================================
+
+c75_colors <- c(
+  "0"  = "#BFBFBF",
+  "1"  = "#70AD47",
+  "10" = "#C55A11"
+)
+
+
+## ============================================================
+## 12. Output directory
+## ============================================================
+
+outdir <- paste0(
+  "Flexible_Plots_EdU_C75_",
+  plot_level
+)
+
+dir.create(
+  outdir,
+  showWarnings = FALSE
+)
+
+
+## ============================================================
+## 13. Loop over features
+## ============================================================
+
+for (f in unique(df_plot_ready$Feature)) {
+
+  ## ==========================================================
+  ## Data for this feature
+  ## ==========================================================
+
+  df_plot <- df_plot_ready %>%
+    filter(
+      Feature == f
+    )
+
+
+  ## ==========================================================
+  ## Statistics
+  ## Compare C75 0 vs 1 and 0 vs 10
+  ## within each Cytokine and Disease
+  ## ==========================================================
+
+  comparisons <- list(
+    c("0", "1"),
+    c("0", "10")
+  )
+
+  stat_result <- df_plot %>%
+    group_by(
+      Disease,
+      Cytokine
+    ) %>%
+    wilcox_test(
+      Intensity ~ C75,
+      comparisons = comparisons,
+      paired = TRUE,
+      id = "Patient",
+      p.adjust.method = "holm"
+    )
+
+
+  ## ==========================================================
+  ## Format p-values
+  ## ==========================================================
+
+  stat.test <- stat_result %>%
+    mutate(
+      p.signif = case_when(
+        p.adj <= 0.001 ~ "***",
+        p.adj <= 0.01  ~ "**",
+        p.adj <= 0.05  ~ "*",
+        TRUE ~ paste0(
+          "p = ",
+          signif(p.adj, 2)
+        )
+      )
+    )
+
+
+  ## ==========================================================
+  ## Y positions
+  ## ==========================================================
+
+  y_max <- df_plot %>%
+    group_by(
+      Disease,
+      Cytokine
+    ) %>%
+    summarise(
+      ymax = max(
+        Intensity,
+        na.rm = TRUE
+      ),
+      .groups = "drop"
+    )
+
+  stat.test <- stat.test %>%
+    left_join(
+      y_max,
+      by = c(
+        "Disease",
+        "Cytokine"
+      )
+    ) %>%
+    group_by(
+      Disease,
+      Cytokine
+    ) %>%
+    mutate(
+      y.position =
+        ymax +
+        row_number() * 0.3
+    ) %>%
+    ungroup()
+
+
+  ## ==========================================================
+  ## X positions for brackets
+  ## ==========================================================
+
+  ## Cytokine positions:
+  ## control = 1
+  ## IL1     = 2
+  ## IL6     = 3
+  ## TGFb    = 4
+
+  cytokine_position <- tibble(
+    Cytokine = factor(
+      cytokines_to_plot,
+      levels = cytokines_to_plot
+    ),
+    x_center = seq_along(
+      cytokines_to_plot
+    )
+  )
+
+  stat.test <- stat.test %>%
+    left_join(
+      cytokine_position,
+      by = "Cytokine"
+    ) %>%
+    mutate(
+
+      ## position of C75 groups within each cytokine
+      xmin = case_when(
+        group1 == "0" ~ x_center - 0.27,
+        group1 == "1" ~ x_center,
+        group1 == "10" ~ x_center + 0.27
+      ),
+
+      xmax = case_when(
+        group2 == "0" ~ x_center - 0.27,
+        group2 == "1" ~ x_center,
+        group2 == "10" ~ x_center + 0.27
+      )
+    )
+
+
+  ## ==========================================================
+  ## Plot
+  ## ==========================================================
+
+  p <- ggplot(
+    df_plot,
+    aes(
+      x = Cytokine,
+      y = Intensity,
+      fill = C75
+    )
+  ) +
+
+    ## Violin
+    geom_violin(
+      trim = FALSE,
+      alpha = 0.65,
+      width = 0.8,
+      color = "black",
+      linewidth = 0.8,
+      position = position_dodge(
+        width = 0.8
+      )
+    ) +
+
+    ## Individual patient observations
+    geom_jitter(
+      position = position_jitterdodge(
+        jitter.width = 0.12,
+        dodge.width = 0.8
+      ),
+      shape = 21,
+      color = "black",
+      stroke = 0.6,
+      size = ifelse(
+        plot_level == "patient",
+        3.2,
+        1.8
+      ),
+      alpha = 0.9
+    ) +
+
+    ## C75 colors
+    scale_fill_manual(
+      values = c75_colors,
+      labels = c(
+        "0"  = "0 µM",
+        "1"  = "1 µM",
+        "10" = "10 µM"
+      ),
+      drop = FALSE
+    ) +
+
+    ## Disease facets
+    facet_wrap(
+      ~ Disease
+    ) +
+
+    ## Labels
+    labs(
+      title = f,
+      y = "Z-scored log intensity",
+      x = "Cytokine",
+      fill = "C75"
+    ) +
+
+    ## Theme
+    theme_bw(
+      base_size = 18
+    ) +
+
+    theme(
+      plot.title = element_text(
+        size = 16,
+        face = "bold",
+        hjust = 0.5
+      ),
+      axis.title = element_text(
+        size = 18,
+        face = "bold"
+      ),
+      axis.text.x = element_text(
+        size = 16
+      ),
+      strip.text = element_text(
+        size = 18,
+        face = "bold"
+      ),
+      panel.grid = element_blank()
+    )
+
+
+  ## ==========================================================
+  ## Add statistics
+  ## ==========================================================
+
+  if (
+    !is.null(stat.test) &&
+    nrow(stat.test) > 0
+  ) {
+
+    p <- p +
+      stat_pvalue_manual(
+        stat.test,
+        label = "p.signif",
+        xmin = "xmin",
+        xmax = "xmax",
+        y.position = "y.position",
+        size = 5,
+        tip.length = 0.01,
+        bracket.size = 0.6
+      )
+  }
+
+
+  ## ==========================================================
+  ## Print
+  ## ==========================================================
+
+  print(p)
+
+
+  ## ==========================================================
+  ## Save
+  ## ==========================================================
+
+  ggsave(
+    file.path(
+      outdir,
+      paste0(
+        gsub(
+          "[^A-Za-z0-9_]+",
+          "_",
+          f
+        ),
+        ".pdf"
+      )
+    ),
+    p,
+    width = 10,
+    height = 6,
+    dpi = 300
+  )
+}
+
+```
+analyse EdU
+
+```{r}
+# Extract EdU feature + metadata
+df <- data.frame(
+    EdU = as.numeric(
+        assay(sce, "tfmfeatures")[
+            "Intensity_MeanIntensity_CorrMitosox",
+            ,
+            drop = TRUE
+        ]
+    ),
+    C75 = colData(sce)$C75,
+    Cytokine = colData(sce)$Cytokine
+) %>%
+    filter(is.finite(EdU))
+
+
+# Make C75 order explicit
+df <- df %>%
+    mutate(
+        C75 = factor(
+            C75,
+            levels = c(0, 1, 10)
+        )
+    )
+
+
+# Histogram
+ggplot(df, aes(x = EdU)) +
+  geom_histogram(
+    bins = 50,
+    fill = "grey70",
+    color = "black"
+  ) +
+  geom_vline(
+    xintercept = 1,
+    linetype = "dashed",
+    linewidth = 0.8
+  ) +
+  facet_grid(
+    Cytokine ~ C75
+  ) +
+  theme_classic() +
+  labs(
+    x = "Intensity_MeanIntensity_CorrMitosox",
+    y = "Number of cells"
+  )
+
+# ============================================================
+# 1. Extract EdU intensity + metadata
+# ============================================================
+
+df <- data.frame(
+  EdU = as.numeric(
+    assay(sce, "tfmfeatures")[
+      "Intensity_MeanIntensity_CorrEdU",
+      ,
+      drop = TRUE
+    ]
+  ),
+  colData(sce)
+)
+
+# Remove NA / Inf
+df <- df %>%
+  filter(is.finite(EdU))
+
+
+# ============================================================
+# 2. Define EdU-positive cells
+# ============================================================
+
+cutoff <- 1
+
+df <- df %>%
+  mutate(
+    EdU_positive = EdU > cutoff
+  )
+
+
+# ============================================================
+# 3. Calculate % EdU-positive per patient
+#    Combine all C75 doses
+# ============================================================
+df_patient <- df %>%
+  group_by(
+    Patient,
+    Disease,
+    Cytokine,
+    C75       
+  ) %>%
+  summarise(
+    n_cells = n(),
+    n_positive = sum(EdU > 1),
+    pct_EdU_positive = 100 * n_positive / n_cells,
+    .groups = "drop"
+  )
+
+
+
+# ==========================================================
+# 1. Define cytokine conditions
+# ==========================================================
+
+cytokines <- c("control", "IL1", "IL6", "TGFb")
+
+# Cytokines to make separate graphs for
+stimulated_cytokines <- c("IL1", "IL6", "TGFb")
+
+
+# ==========================================================
+# 2. Keep only C75 doses of interest
+# ==========================================================
+
+df_patient <- df_patient %>%
+  filter(
+    C75 %in% c(0, 1, 10),
+    Cytokine %in% cytokines
+  ) %>%
+  mutate(
+    C75 = factor(
+      C75,
+      levels = c(0, 1, 10),
+      labels = c("0", "1", "10")
+    )
+  )
+
+control <- df_patient %>%
+  filter(Cytokine == "control") %>%
+  crossing(
+    Comparison = stimulated_cytokines
+  ) %>%
+  mutate(
+    Condition = "Control"
+  )
+
+
+# ==========================================================
+# 4. Get cytokine-treated samples
+# ==========================================================
+
+stim <- df_patient %>%
+  filter(
+    Cytokine %in% stimulated_cytokines
+  ) %>%
+  mutate(
+    Comparison = Cytokine,
+    Condition = Cytokine
+  )
+
+
+# ==========================================================
+# 5. Combine Control + cytokine
+# ==========================================================
+
+df_compare <- bind_rows(
+  control,
+  stim
+)
+
+
+# ==========================================================
+# 6. Plot one separate graph for each cytokine
+# ==========================================================
+
+for (cyt in stimulated_cytokines) {
+
+  df_plot <- df_compare %>%
+    filter(Comparison == cyt)
+
+  p <- ggplot(
+    df_plot,
+    aes(
+      x = C75,
+      y = pct_EdU_positive,
+      color = Condition,
+      group = interaction(Patient, Condition)
+    )
+  ) +
+
+    # Connect each patient's measurements across C75 doses
+    geom_line(
+      alpha = 0.4,
+      linewidth = 0.5
+    ) +
+
+    # Individual patient dots
+    geom_point(
+      size = 2.5
+    ) +
+
+    # OA and RA side-by-side
+    facet_wrap(
+      ~ Disease,
+      ncol = 2
+    ) +
+
+    theme_classic() +
+
+    labs(
+      title = paste("Control vs", cyt),
+      x = "C75 dose (µM)",
+      y = "% EdU-positive cells",
+      color = NULL
+    )
+
+  print(p)
+}
+```
+
+check EdU distribution
+
+```{r}
+p_density <- tb_sce |>
+    ggplot(aes(
+        Intensity_MeanIntensity_CorrEdU,
+        color = Patient
+    )) +
+    geom_density() +
+    facet_grid(
+        Cytokine ~ C75,
+        scales = "free"
+    )
+
+p_density <- tb_sce |>
+    ggplot(aes(
+        Intensity_MeanIntensity_CorrEdU,
+        color = Patient
+    )) +
+    geom_density() +
+    geom_vline(
+        xintercept = 1,
+        linetype = "dashed"
+    ) +
+    facet_grid(
+        Cytokine ~ C75,
+        scales = "fixed"
+    ) +
+    theme_classic()
+
+p_density
+```
+PCA
+```{r}
+sce <- scater::runPCA(sce,
+    assay.type = "tfmfeatures",
+    ncomponents = 10
+)
+p <- scater::plotReducedDim(sce, dimred = "PCA", colour_by = "Cytokine")
+
+p
+```
+detect EdU cutoff 
+
+```{r}
+tb_sce <- lapply(c("tfmfeatures"), function(assay_type) {
+    makePerCellDF(
+        sce,
+        assay.type = assay_type,
+        features = "Intensity_MeanIntensity_CorrEdU"
+    ) |>
+        mutate(
+            Assay = assay_type,
+            Patient = factor(Patient)
+        )
+}) |> bind_rows()
+
+# ============================================================
+# 1. Function to find cutoff between peak 1 and peak 2
+# ============================================================
+find_valley_cutoff <- function(
+    x,
+    n = 2048,
+    adjust = 1.5,
+    min_peak_height = 0.20,
+    min_peak_distance = 0.5
+) {
+
+  x <- x[is.finite(x)]
+
+  if (length(x) < 20) {
+    return(data.frame(
+      cutoff = NA_real_,
+      peak1 = NA_real_,
+      peak2 = NA_real_,
+      n_peaks = 0,
+      method = "too_few_cells",
+      n_cells = length(x)
+    ))
+  }
+
+  d <- density(
+    x,
+    n = n,
+    adjust = adjust
+  )
+
+  dx <- d$x[2] - d$x[1]
+
+  peaks <- findpeaks(
+    d$y,
+    minpeakheight = max(d$y) * min_peak_height,
+    minpeakdistance = round(min_peak_distance / dx)
+  )
+
+  if (is.null(peaks)) {
+    return(data.frame(
+      cutoff = NA_real_,
+      peak1 = NA_real_,
+      peak2 = NA_real_,
+      n_peaks = 0,
+      method = "no_peak",
+      n_cells = length(x)
+    ))
+  }
+
+  peak_idx <- peaks[, 2]
+
+  peak_idx <- peak_idx[
+    order(d$x[peak_idx])
+  ]
+
+  n_peaks <- length(peak_idx)
+
+  peak1_idx <- peak_idx[1]
+  peak1 <- d$x[peak1_idx]
+
+  # ----------------------------------------------------------
+  # TWO OR MORE PEAKS
+  # ----------------------------------------------------------
+
+  if (n_peaks >= 2) {
+
+    peak2_idx <- peak_idx[2]
+    peak2 <- d$x[peak2_idx]
+
+    between <- peak1_idx:peak2_idx
+
+    valley_idx <- between[
+      which.min(d$y[between])
+    ]
+
+    cutoff <- d$x[valley_idx]
+
+    return(data.frame(
+      cutoff = cutoff,
+      peak1 = peak1,
+      peak2 = peak2,
+      n_peaks = n_peaks,
+      method = "valley_between_peak1_peak2",
+      n_cells = length(x)
+    ))
+  }
+
+  # ----------------------------------------------------------
+  # ONLY ONE PEAK
+  # ----------------------------------------------------------
+
+  cutoff <- peak1 + 0.6
+
+  data.frame(
+    cutoff = cutoff,
+    peak1 = peak1,
+    peak2 = NA_real_,
+    n_peaks = 1,
+    method = "immediately_after_peak1",
+    n_cells = length(x)
+  )
+}
+
+cutoff_table <- tb_sce %>%
+  group_by(Patient, Cytokine, C75) %>%
+  group_modify(~ find_valley_cutoff(
+    .x$Intensity_MeanIntensity_CorrEdU
+  )) %>%
+  ungroup()
+
+cutoff_table
+
+# see plot for 1 patient
+
+patient <- unique(tb_sce$Patient)[2]
+
+df_plot <- tb_sce %>%
+  filter(Patient == patient)
+
+df_cutoff <- cutoff_table %>%
+  filter(Patient == patient)
+
+p <- ggplot(
+  df_plot,
+  aes(x = Intensity_MeanIntensity_CorrEdU)
+) +
+  geom_density(
+    linewidth = 1
+  ) +
+
+  # RED = cutoff
+  geom_vline(
+    data = df_cutoff %>%
+      filter(is.finite(cutoff)),
+    aes(xintercept = cutoff),
+    linetype = "dashed",
+    linewidth = 1,
+    color = "red"
+  ) +
+
+  # BLUE = first peak
+  geom_vline(
+    data = df_cutoff %>%
+      filter(is.finite(peak1)),
+    aes(xintercept = peak1),
+    linetype = "dotted",
+    linewidth = 0.8,
+    color = "blue"
+  ) +
+
+  # GREEN = second peak
+  geom_vline(
+    data = df_cutoff %>%
+      filter(is.finite(peak2)),
+    aes(xintercept = peak2),
+    linetype = "dotted",
+    linewidth = 0.8,
+    color = "darkgreen"
+  ) +
+
+  facet_grid(
+    Cytokine ~ C75
+  ) +
+
+  coord_cartesian(
+    xlim = c(-2, 5)
+  ) +
+
+  labs(
+    title = paste("Patient:", patient),
+    x = "Intensity_MeanIntensity_CorrEdU",
+    y = "Density"
+  ) +
+
+  theme_classic()
+
+print(p)
+```
+Calculate EdU-positive cells
+```{r}
+# ============================================================
+# Calculate % EdU positive per Patient × Cytokine × C75
+# ============================================================
+
+edu_positive <- tb_sce %>%
+  left_join(
+    cutoff_table %>%
+      select(Patient, Cytokine, C75, cutoff),
+    by = c("Patient", "Cytokine", "C75")
+  ) %>%
+  mutate(
+    EdU_positive = Intensity_MeanIntensity_CorrEdU >= cutoff
+  )
+
+edu_patient <- edu_positive %>%
+  group_by(Patient, Cytokine, C75) %>%
+  summarise(
+    n_cells = n(),
+    n_positive = sum(EdU_positive, na.rm = TRUE),
+    percent_positive = 100 * mean(EdU_positive, na.rm = TRUE),
+    cutoff = first(cutoff),
+    .groups = "drop"
+  )
+
+edu_patient
+
+edu_summary <- edu_patient %>%
+  group_by(Cytokine, C75) %>%
+  summarise(
+    mean_percent = mean(percent_positive, na.rm = TRUE),
+    sd_percent = sd(percent_positive, na.rm = TRUE),
+    n_patients = sum(is.finite(percent_positive)),
+    sem_percent = sd_percent / sqrt(n_patients),
+    .groups = "drop"
+  )
+
+p_edu <- ggplot(
+  edu_summary,
+  aes(x = Cytokine, y = mean_percent)
+) +
+
+  # Mean bar
+  geom_col(
+    width = 0.7
+  ) +
+
+  # SEM
+  geom_errorbar(
+    aes(
+      ymin = mean_percent - sem_percent,
+      ymax = mean_percent + sem_percent
+    ),
+    width = 0.2
+  ) +
+
+  # Individual patients
+  geom_jitter(
+    data = edu_patient,
+    aes(
+      x = Cytokine,
+      y = percent_positive
+    ),
+    width = 0.12,
+    height = 0,
+    size = 2.5,
+    alpha = 0.8
+  ) +
+
+  facet_wrap(
+    ~ C75,
+    nrow = 1
+  ) +
+
+  labs(
+    x = "Cytokine",
+    y = "EdU-positive cells (%)"
+  ) +
+
+  theme_classic()
+
+print(p_edu)
+
+ggsave(
+  filename = "EdU_positive_C75.pdf",
+  plot = p_edu,
+  width = 12,
+  height = 8,
+  units = "in"
+)
+
+```
